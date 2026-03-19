@@ -150,6 +150,7 @@ def fetch_active_markets() -> list[dict]:
     markets: list[dict] = []
     cursor: Optional[str] = None
     page = 0
+    last_found_page = 0  # track when we last found an active market
 
     while True:
         params: dict = {"status": "open", "limit": MARKET_PAGE_SIZE}
@@ -159,7 +160,7 @@ def fetch_active_markets() -> list[dict]:
         data = _get("/markets", params=params)
         batch = data.get("markets", [])
         page += 1
-        logger.debug("Kalshi page %d: %d markets (cursor=%s)", page, len(batch), cursor)
+        logger.info("Kalshi page %d: %d markets fetched so far=%d", page, len(batch), len(markets))
 
         if not batch:
             break
@@ -169,11 +170,18 @@ def fetch_active_markets() -> list[dict]:
             if not ticker:
                 continue
 
+            # Skip provisional markets and markets with no 24h volume.
+            if m.get("is_provisional"):
+                continue
+            if float(m.get("volume_24h_fp") or 0) <= 0:
+                continue
+
             yes_ask      = _parse_price(m.get("yes_ask_dollars") or m.get("yes_ask"))
             no_ask       = _parse_price(m.get("no_ask_dollars")  or m.get("no_ask"))
             yes_ask_size = float(m.get("yes_ask_size_fp") or m.get("yes_ask_size") or 0)
             no_ask_size  = float(m.get("no_ask_size_fp")  or m.get("no_ask_size")  or 0)
 
+            last_found_page = page
             markets.append({
                 "ticker":            ticker,
                 "event_ticker":      m.get("event_ticker", ""),
@@ -183,6 +191,7 @@ def fetch_active_markets() -> list[dict]:
                 "seed_no_ask":       no_ask,
                 "seed_yes_ask_size": yes_ask_size,
                 "seed_no_ask_size":  no_ask_size,
+                "volume_24h":        float(m.get("volume_24h_fp") or 0),
             })
 
         cursor = data.get("cursor")
@@ -192,6 +201,13 @@ def fetch_active_markets() -> list[dict]:
         if MAX_MARKETS and len(markets) >= MAX_MARKETS:
             break
 
+        if MAX_MARKETS and len(markets) >= MAX_MARKETS:
+            break
+
+        time.sleep(0.1)  # 100ms between listing pages to stay within rate limits
+
+    # Sort by 24h volume descending so MAX_MARKETS cap keeps the most liquid
+    markets.sort(key=lambda m: m["volume_24h"], reverse=True)
     result = markets[:MAX_MARKETS] if MAX_MARKETS else markets
 
     # Drop markets that closed more than 1 hour ago
@@ -257,6 +273,7 @@ def fetch_market_prices(tickers: list[str]) -> dict[str, dict]:
                 }
         except Exception as exc:
             logger.warning("fetch_market_prices batch error: %s", exc)
+        time.sleep(0.2)  # 200 ms between batches — ~5 req/s, within Kalshi rate limits
 
     return results
 

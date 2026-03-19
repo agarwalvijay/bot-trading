@@ -321,6 +321,14 @@ def compute_multi_outcome_opportunity(markets: list, source: str = "REST") -> Op
     if sum_asks >= 1.0:
         return None
 
+    # Sanity check: for truly mutually exclusive outcomes the sum of YES asks
+    # must be reasonably close to 1.0.  Correlated threshold markets (e.g.
+    # "Over 135pts", "Over 156pts", "Over 162pts") share an event_ticker but
+    # are NOT exhaustive — their YES prices can sum to 0.35 or less.
+    # We require sum > 0.7 to avoid these false positives.
+    if sum_asks < 0.70:
+        return None
+
     gross_profit   = 1.0 - sum_asks
     total_fees_val = _total_fees(ask_prices)
     net_profit     = gross_profit - total_fees_val
@@ -763,12 +771,49 @@ def _check_ticker_market(ticker: str, source: str) -> None:
 # ---------------------------------------------------------------------------
 
 def market_refresh_loop(ws_client: Optional[KalshiWSClient], stop_event: threading.Event) -> None:
-    """Periodically re-fetch the active market list and update WS subscriptions."""
+    """
+    Periodically refresh the market list.
+
+    Because Kalshi has millions of markets and the full paginating scan takes
+    several minutes, we use two strategies:
+
+    Fast refresh (every MARKET_REFRESH_INTERVAL):
+      Re-fetch only the tickers we already know via GET /markets?tickers=...
+      This updates prices + detects closed markets quickly without re-paginating.
+
+    Full rescan (every 6 hours):
+      Re-run fetch_active_markets() to discover newly opened markets.
+    """
     logger.info("Market refresh loop started (interval=%.0fs)", MARKET_REFRESH_INTERVAL)
+    FULL_RESCAN_INTERVAL = 6 * 3600  # full re-paginate every 6 hours
+    last_full_rescan = time.time()
+
     while not stop_event.is_set():
         try:
-            markets = fetch_active_markets()
-            new_tickers: dict[str, dict] = {m["ticker"]: m for m in markets}
+            now_ts = time.time()
+            do_full = (now_ts - last_full_rescan) >= FULL_RESCAN_INTERVAL
+
+            if do_full:
+                logger.info("Running full market rescan…")
+                markets = fetch_active_markets()
+                new_tickers: dict[str, dict] = {m["ticker"]: m for m in markets}
+                last_full_rescan = now_ts
+            else:
+                # Fast path: re-fetch only known tickers to update prices + detect closures
+                known = list(markets_by_ticker.keys())
+                if not known:
+                    stop_event.wait(MARKET_REFRESH_INTERVAL)
+                    continue
+                refreshed = fetch_market_prices(known)
+                new_tickers = {}
+                for ticker, prices in refreshed.items():
+                    m = markets_by_ticker.get(ticker, {}).copy()
+                    m.update(prices)
+                    new_tickers[ticker] = m
+                # Drop any tickers that didn't come back (closed/settled)
+                for ticker in known:
+                    if ticker not in refreshed:
+                        new_tickers.pop(ticker, None)
 
             # Atomic swap: add/update first, then remove evicted
             markets_by_ticker.update(new_tickers)
@@ -786,17 +831,18 @@ def market_refresh_loop(ws_client: Optional[KalshiWSClient], stop_event: threadi
                     with priority_lock:
                         priority_tickers.discard(t)
 
-            # Seed live_prices from market listing (size=0 until real book data arrives)
-            with prices_lock:
-                for m in markets:
-                    t = m["ticker"]
-                    if t not in live_prices:
-                        live_prices[t] = {
-                            "yes_ask":      m.get("seed_yes_ask"),
-                            "yes_ask_size": m.get("seed_yes_ask_size", 0.0),
-                            "no_ask":       m.get("seed_no_ask"),
-                            "no_ask_size":  m.get("seed_no_ask_size", 0.0),
-                        }
+            # Seed live_prices for newly discovered markets (full rescan only)
+            if do_full:
+                with prices_lock:
+                    for m in new_tickers.values():
+                        t = m["ticker"]
+                        if t not in live_prices:
+                            live_prices[t] = {
+                                "yes_ask":      m.get("seed_yes_ask"),
+                                "yes_ask_size": m.get("seed_yes_ask_size", 0.0),
+                                "no_ask":       m.get("seed_no_ask"),
+                                "no_ask_size":  m.get("seed_no_ask_size", 0.0),
+                            }
 
             if ws_client:
                 all_t = list(markets_by_ticker.keys())
@@ -853,22 +899,29 @@ def main() -> None:
     signal.signal(signal.SIGINT,  _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    logger.info("Loading initial market list …")
-    try:
-        markets = fetch_active_markets()
-        for m in markets:
-            markets_by_ticker[m["ticker"]] = m
-            live_prices[m["ticker"]] = {
-                "yes_ask":      m.get("seed_yes_ask"),
-                "yes_ask_size": m.get("seed_yes_ask_size", 0.0),
-                "no_ask":       m.get("seed_no_ask"),
-                "no_ask_size":  m.get("seed_no_ask_size", 0.0),
-            }
-        logger.info("Loaded %d markets", len(markets_by_ticker))
-        _log_market_composition()
-    except Exception as exc:
-        logger.critical("Failed to load initial markets: %s", exc)
-        sys.exit(1)
+    # Kick off the initial market scan in a background thread so the bot
+    # starts polling/listening immediately.  The REST poller handles an empty
+    # markets_by_ticker gracefully (no-op until markets arrive).
+    logger.info("Starting background initial market scan …")
+    def _initial_load():
+        try:
+            markets = fetch_active_markets()
+            for m in markets:
+                markets_by_ticker[m["ticker"]] = m
+                with prices_lock:
+                    if m["ticker"] not in live_prices:
+                        live_prices[m["ticker"]] = {
+                            "yes_ask":      m.get("seed_yes_ask"),
+                            "yes_ask_size": m.get("seed_yes_ask_size", 0.0),
+                            "no_ask":       m.get("seed_no_ask"),
+                            "no_ask_size":  m.get("seed_no_ask_size", 0.0),
+                        }
+            logger.info("Initial market scan complete: %d markets loaded", len(markets_by_ticker))
+            _log_market_composition()
+        except Exception as exc:
+            logger.error("Initial market scan failed: %s", exc)
+
+    threading.Thread(target=_initial_load, daemon=True, name="initial-load").start()
 
     ws_client: Optional[KalshiWSClient] = None
     event_queue: queue.Queue = queue.Queue()

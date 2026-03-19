@@ -32,7 +32,7 @@ MAX_MARKETS = int(os.getenv("MAX_MARKETS", "0"))
 MARKET_PAGE_SIZE = int(os.getenv("MARKET_PAGE_SIZE", "1000"))
 
 # Number of tickers per batch when refreshing prices via GET /markets?tickers=
-BOOK_BATCH_SIZE = int(os.getenv("BOOK_BATCH_SIZE", "200"))
+BOOK_BATCH_SIZE = int(os.getenv("BOOK_BATCH_SIZE", "50"))
 
 # Maximum market tickers to subscribe to via WebSocket
 MAX_WS_MARKETS = int(os.getenv("MAX_WS_MARKETS", "500"))
