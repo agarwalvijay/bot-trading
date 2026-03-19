@@ -1,17 +1,17 @@
 """
-Polymarket Arbitrage Bot — Orchestrator & Scanner
-==================================================
+Kalshi Arbitrage Bot — Orchestrator & Scanner
+==============================================
 
-Phase 1  (implemented)
-  • Fetches active markets from the Gamma API
-  • Detects underround opportunities: sum of best-ask prices < 1.0
-  • Filters by minimum net profit after a configurable fee rate
-  • Logs every opportunity to SQLite
-  • Alerts to console (and optionally Telegram)
-  • WebSocket feed provides real-time price updates alongside REST polling
+Detects underround opportunities on Kalshi: sum of best-ask prices across
+all outcomes of an event < $1.00.  Buying all outcomes guarantees a $1
+payout, so any sum < $1 minus fees is risk-free profit.
 
-Phase 2  (stub — see execute_arb())
-  • A clear hook is left for actual order execution once credentials are wired in
+Binary markets  : YES ask + NO ask < 1.0
+Categorical events : sum of YES ask across all sibling outcome markets < 1.0
+
+Fee model (Kalshi parabolic):
+    fee_per_leg = TAKER_FEE_COEFF × price × (1 − price)
+    (highest at $0.50 = 1.75¢/contract; near-zero at $0.01 or $0.99)
 
 Usage
 -----
@@ -34,7 +34,7 @@ from alerter import alert, alert_near_miss, alert_expiring_actionable
 from config import (
     EXPIRING_ACTIONABLE_MIN_PROFIT,
     EXPIRING_SOON_MINS,
-    FEE_RATE,
+    TAKER_FEE_COEFF,
     HIGH_PROFIT_THRESHOLD,
     MARKET_REFRESH_INTERVAL,
     MAX_REST_MARKETS,
@@ -49,10 +49,9 @@ from config import (
 )
 from db import init_db, opportunity_count, save_opportunity, update_opportunity
 from fetcher import (
-    PolymarketWSClient,
-    best_ask,
+    KalshiWSClient,
     fetch_active_markets,
-    fetch_order_books,
+    fetch_market_prices,
 )
 
 logging.basicConfig(
@@ -66,84 +65,93 @@ logger = logging.getLogger("arb_bot")
 # Market state cache
 # ---------------------------------------------------------------------------
 
-# markets_by_condition: condition_id -> market dict (question, tokens, …)
-markets_by_condition: dict[str, dict] = {}
+# markets_by_ticker: ticker -> market dict (title, event_ticker, close_time, …)
+markets_by_ticker: dict[str, dict] = {}
 
-# live_prices: token_id -> {"price": float, "size": float}
-# Updated by both REST polls and WebSocket events
+# live_prices: ticker -> {yes_ask, yes_ask_size, no_ask, no_ask_size}
+# yes_ask / no_ask may be None when there is no live offer on that side.
 live_prices: dict[str, dict] = {}
 prices_lock = threading.Lock()
 
 # Unified alert cooldown — shared by BOTH REST and WS paths.
-# Keyed on condition_id.  Prevents any source from re-alerting the same
-# market within WS_ALERT_COOLDOWN_SECS regardless of which thread fires first.
+# Keyed on ticker (or event_ticker for multi-outcome events).
 # Schema: {last_alert_at: datetime, last_net_profit: float}
 alert_cooldown: dict[str, dict] = {}
 alert_cooldown_lock = threading.Lock()
 
 # REST-only DB state — tracks the active DB row for each live opportunity
-# so REST can update it in-place instead of inserting a duplicate each cycle.
+# so REST can update it in-place rather than inserting duplicates each cycle.
 # Schema: {row_id: int, sum_asks: float}
 rest_state: dict[str, dict] = {}
 rest_state_lock = threading.Lock()
 
 # WS activity tracking for Option-C REST scheduling.
-# ws_activity: condition_id -> datetime of most-recent WS price event.
-# ws_event_log: deque of (datetime, condition_id) for rolling 60s coverage metrics.
+# ws_activity: ticker -> datetime of most-recent WS price event.
+# ws_event_log: deque of (datetime, ticker) for rolling 60s coverage metrics.
 ws_activity: dict[str, datetime] = {}
 ws_activity_lock = threading.Lock()
 ws_event_log: collections.deque = collections.deque()  # type: ignore[type-arg]
 
-# Rolling-chunk REST pointer: absolute counter; modded against total cold markets each cycle.
+# Rolling-chunk REST pointer
 _rest_chunk_start: int = 0
 
-# Module-level WS client reference — set in main() before threads start so that
-# REST and other helpers can trigger subscription updates without needing the object
-# passed through every call chain.
-_ws_client: Optional[PolymarketWSClient] = None
+# Module-level WS client reference — set in main() before threads start
+_ws_client: Optional[KalshiWSClient] = None
 
-# Priority WS tokens — REST-detected opportunity tokens are promoted to the front
-# of the WS subscription so they survive the MAX_WS_TOKENS cap and receive
-# real-time tick-by-tick updates immediately after REST spots them.
-priority_token_ids: set[str] = set()
+# Priority WS tickers — REST-detected opportunity tickers are promoted to the
+# front of the WS subscription so they survive the MAX_WS_MARKETS cap.
+priority_tickers: set[str] = set()
 priority_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Fee helpers
+# ---------------------------------------------------------------------------
+
+def _kalshi_fee(price: float) -> float:
+    """
+    Kalshi taker fee for 1 contract at `price`.
+    fee = TAKER_FEE_COEFF × price × (1 − price)
+    """
+    return TAKER_FEE_COEFF * price * (1.0 - price)
+
+
+def _total_fees(ask_prices: list[float]) -> float:
+    """Sum of taker fees across all legs (1 contract each)."""
+    return sum(_kalshi_fee(p) for p in ask_prices)
+
 
 # ---------------------------------------------------------------------------
 # WS priority subscription helper
 # ---------------------------------------------------------------------------
 
-def _prioritize_opportunity_tokens(token_ids: list[str]) -> None:
+def _prioritize_opportunity_tickers(tickers: list[str]) -> None:
     """
-    Promote token_ids to the front of the WS subscription list.
+    Promote tickers to the front of the WS subscription list.
 
     Called by REST when it detects a live opportunity so that subsequent
     price ticks arrive in real-time via WS rather than waiting for the next
-    REST chunk cycle.  Safe to call even when WS is disabled (_ws_client=None).
+    REST polling cycle.  Safe to call when WS is disabled (_ws_client=None).
     """
     global _ws_client
     with priority_lock:
-        new_tokens = set(token_ids) - priority_token_ids
-        if not new_tokens:
-            return  # already prioritized — no work to do
-        priority_token_ids.update(new_tokens)
+        new_tickers = set(tickers) - priority_tickers
+        if not new_tickers:
+            return
+        priority_tickers.update(new_tickers)
 
     if _ws_client is None:
         return
 
-    # Rebuild subscription: priority tokens first so they survive the cap slice.
-    all_tids = list({
-        t.get("token_id") or t.get("tokenId", "")
-        for m in markets_by_condition.values()
-        for t in m["tokens"]
-    })
-    all_tids_set = set(all_tids)
+    all_t = list(markets_by_ticker.keys())
+    all_t_set = set(all_t)
     with priority_lock:
-        pri = [t for t in priority_token_ids if t in all_tids_set]
-    remaining = [t for t in all_tids if t not in priority_token_ids]
+        pri = [t for t in priority_tickers if t in all_t_set]
+    remaining = [t for t in all_t if t not in priority_tickers]
     _ws_client.update_subscriptions(pri + remaining)
     logger.info(
-        "WS priority bump: +%d tokens promoted  |  total priority=%d",
-        len(new_tokens), len(pri),
+        "WS priority bump: +%d tickers promoted  |  total priority=%d",
+        len(new_tickers), len(pri),
     )
 
 
@@ -153,40 +161,36 @@ def _prioritize_opportunity_tokens(token_ids: list[str]) -> None:
 
 def _group_by_event(markets: list) -> dict:
     """
-    Group markets by their Gamma event_id.
+    Group markets by their Kalshi event_ticker.
 
-    Markets that share an event_id are sibling outcomes of the same categorical
-    event (e.g. ECB: 50bps / 25bps / hold / increase).  Markets without an
-    event_id, or whose event_id is unique in the dataset, are treated as
-    standalone binary markets.
+    Markets sharing an event_ticker are sibling outcomes of the same
+    categorical event (e.g. "Fed rate decision: 25bps / 50bps / hold").
+    Markets with a unique or absent event_ticker are standalone binary markets.
 
     Returns: {event_key: [market, ...]}
-      where event_key is the event_id for multi-outcome events and the
-      condition_id for standalone binary markets.
+      where event_key is event_ticker for multi-outcome groups
+      and ticker for standalone binary markets.
     """
-    # First pass: count how many markets share each event_id.
     event_counts: dict[str, int] = {}
     for m in markets:
-        eid = m.get("event_id", "")
+        eid = m.get("event_ticker", "")
         if eid:
             event_counts[eid] = event_counts.get(eid, 0) + 1
 
     groups: dict[str, list] = {}
     for m in markets:
-        eid = m.get("event_id", "")
-        # Only group under event_id when multiple markets share it.
+        eid = m.get("event_ticker", "")
         if eid and event_counts.get(eid, 0) > 1:
             groups.setdefault(eid, []).append(m)
         else:
-            # Standalone binary — key on condition_id to keep it independent.
-            groups[m["condition_id"]] = [m]
+            groups[m["ticker"]] = [m]
 
     return groups
 
 
 def _log_market_composition() -> None:
     """Log a breakdown of binary vs multi-outcome markets."""
-    groups = _group_by_event(list(markets_by_condition.values()))
+    groups = _group_by_event(list(markets_by_ticker.values()))
     n_binary = sum(1 for ms in groups.values() if len(ms) == 1)
     multi = {k: ms for k, ms in groups.items() if len(ms) > 1}
     n_multi_events  = len(multi)
@@ -196,13 +200,12 @@ def _log_market_composition() -> None:
         "%d multi-outcome events (%d total outcome markets)",
         n_binary, n_multi_events, n_multi_markets,
     )
-    # Log up to 5 sample multi-outcome events so we can verify grouping is correct
     if multi:
         samples = sorted(multi.items(), key=lambda kv: len(kv[1]), reverse=True)[:5]
         for eid, ms in samples:
             logger.info(
-                "  Multi-outcome event  eid=%s  n=%d  first_q=%s",
-                eid, len(ms), ms[0].get("question", "?")[:70],
+                "  Multi-outcome event  eid=%s  n=%d  first_title=%s",
+                eid, len(ms), ms[0].get("title", "?")[:70],
             )
 
 
@@ -212,65 +215,46 @@ def _log_market_composition() -> None:
 
 def compute_opportunity(market: dict, source: str = "REST") -> Optional[dict]:
     """
-    Evaluate one market for arb and near-miss.  Returns a dict with a
-    'category' field ("opportunity" | "near_miss"), or None.
+    Evaluate one binary market for arb / near-miss.
 
-    Filters applied in order
-    ────────────────────────
-    1. Incomplete data       — any leg missing from live_prices → skip
-    2. Near-certain outcome  — any leg ask_price < MIN_LEG_PRICE (1¢) → skip
-    3. No underround         — sum_asks >= 1.0 → skip
-
-    Category rules (evaluated in priority order)
-    ──────────────────────────────────────────────
-    opportunity : net_profit >= MIN_NET_PROFIT  AND  all sizes >= MIN_LEG_SIZE
-    near_miss   : gross_profit > 0  AND  NEAR_MISS_LOWER <= net_profit < 0
-                  (underround exists but fees consume it; maker rebate might flip)
-
-    Extra fields
-    ────────────
-    has_zero_size : True if any leg has size <= 0 (seed-price ghost, not fillable)
-    end_date_iso  : market end date, only populated when net_profit > HIGH_PROFIT_THRESHOLD
+    Checks: YES ask + NO ask < 1.0
+    Both sides must have a live offer (not None) and price >= MIN_LEG_PRICE.
     """
-    # Filter 1: resolved markets (end_date > 10 min in the past) — prices are meaningless
-    mins = _minutes_to_close(market.get("end_date_iso"))
+    mins = _minutes_to_close(market.get("close_time"))
     if mins is not None and mins < -10:
-        return None  # RESOLVED
+        return None  # resolved
 
-    tokens = market["tokens"]
-    ask_prices: list[float] = []
-    ask_sizes: list[float] = []
-    outcomes: list[str] = []
-    token_ids: list[str] = []
-
+    ticker = market["ticker"]
     with prices_lock:
-        for t in tokens:
-            tid = t.get("token_id") or t.get("tokenId", "")
-            outcome = t.get("outcome", tid[:8])
-            entry = live_prices.get(tid)
-            if entry is None:
-                return None  # never polled
-            if entry["price"] is None:
-                return None  # polled but /books returned empty asks — NO_BOOK
-            ask_prices.append(entry["price"])
-            ask_sizes.append(entry["size"])
-            outcomes.append(outcome)
-            token_ids.append(tid)
+        entry = live_prices.get(ticker)
 
-    # Filter 2: near-certain outcomes distort the sum and aren't real inefficiencies
+    if entry is None:
+        return None  # never polled
+
+    yes_ask      = entry.get("yes_ask")
+    no_ask       = entry.get("no_ask")
+    yes_ask_size = entry.get("yes_ask_size", 0.0)
+    no_ask_size  = entry.get("no_ask_size", 0.0)
+
+    if yes_ask is None or no_ask is None:
+        return None  # no live book on one side
+
+    ask_prices = [yes_ask, no_ask]
+    ask_sizes  = [yes_ask_size, no_ask_size]
+    outcomes   = ["Yes", "No"]
+
     if any(p < MIN_LEG_PRICE for p in ask_prices):
         return None
 
     sum_asks = sum(ask_prices)
     if sum_asks >= 1.0:
-        return None  # no underround
+        return None
 
     gross_profit = 1.0 - sum_asks
-    total_fees = FEE_RATE * sum_asks
-    net_profit = gross_profit - total_fees
+    total_fees_val = _total_fees(ask_prices)
+    net_profit   = gross_profit - total_fees_val
     has_zero_size = any(s <= 0 for s in ask_sizes)
 
-    # Classify
     if net_profit >= MIN_NET_PROFIT and all(s >= MIN_LEG_SIZE for s in ask_sizes):
         category = "opportunity"
     elif gross_profit > 0 and NEAR_MISS_LOWER <= net_profit < 0:
@@ -278,71 +262,57 @@ def compute_opportunity(market: dict, source: str = "REST") -> Optional[dict]:
     else:
         return None
 
-    # Always attach end_date_iso for opportunities so alerter can compute time-to-close
-    end_date_iso = market.get("end_date_iso", "") if category == "opportunity" else None
+    close_time = market.get("close_time", "") if category == "opportunity" else None
 
     return {
-        "condition_id": market["condition_id"],
-        "question": market["question"],
-        "token_ids": token_ids,
-        "outcomes": outcomes,
-        "ask_prices": ask_prices,
-        "ask_sizes": ask_sizes,
-        "sum_asks": sum_asks,
-        "gross_profit": gross_profit,
-        "total_fees": total_fees,
-        "net_profit": net_profit,
-        "fee_rate": FEE_RATE,
-        "source": source,
-        "category": category,
-        "has_zero_size": has_zero_size,
-        "end_date_iso": end_date_iso,
+        "ticker":         ticker,
+        "event_ticker":   market.get("event_ticker", ""),
+        "title":          market.get("title", ticker),
+        "outcomes":       outcomes,
+        "ask_prices":     ask_prices,
+        "ask_sizes":      ask_sizes,
+        "sum_asks":       sum_asks,
+        "gross_profit":   gross_profit,
+        "total_fees":     total_fees_val,
+        "net_profit":     net_profit,
+        "taker_fee_coeff": TAKER_FEE_COEFF,
+        "source":         source,
+        "category":       category,
+        "has_zero_size":  has_zero_size,
+        "close_time":     close_time,
     }
 
 
 def compute_multi_outcome_opportunity(markets: list, source: str = "REST") -> Optional[dict]:
     """
-    Evaluate a multi-outcome event for arb.
+    Evaluate a multi-outcome categorical event for arb.
 
-    The correct arb check is: sum of YES best-asks across ALL sibling outcome
-    markets < 1.0.  Buying YES on every outcome guarantees exactly one $1
-    payout (the outcome that occurs).
-
-    We NEVER sum YES+NO within a single outcome market here — that binary
-    check is reserved for truly standalone binary markets via compute_opportunity().
+    Correct check: sum of YES asks across ALL sibling outcome markets < 1.0.
+    Buying YES on every outcome guarantees exactly one $1 payout.
     """
-    # Skip if any outcome market is resolved
     for market in markets:
-        mins = _minutes_to_close(market.get("end_date_iso"))
+        mins = _minutes_to_close(market.get("close_time"))
         if mins is not None and mins < -10:
             return None
 
     ask_prices: list[float] = []
     ask_sizes:  list[float] = []
     outcomes:   list[str]   = []
-    token_ids:  list[str]   = []
+    tickers:    list[str]   = []
 
     with prices_lock:
         for market in markets:
-            # Identify the YES token: outcome label "Yes", or first token by convention.
-            yes_tok = next(
-                (t for t in market["tokens"] if t.get("outcome", "").lower() == "yes"),
-                market["tokens"][0] if market["tokens"] else None,
-            )
-            if yes_tok is None:
-                return None
-
-            tid = yes_tok.get("token_id") or yes_tok.get("tokenId", "")
-            entry = live_prices.get(tid)
+            t = market["ticker"]
+            entry = live_prices.get(t)
             if entry is None:
-                return None           # never polled
-            if entry["price"] is None:
-                return None           # no live book for this leg
-
-            ask_prices.append(entry["price"])
-            ask_sizes.append(entry["size"])
-            outcomes.append(market.get("question", "")[:60])
-            token_ids.append(tid)
+                return None
+            yes_ask = entry.get("yes_ask")
+            if yes_ask is None:
+                return None
+            ask_prices.append(yes_ask)
+            ask_sizes.append(entry.get("yes_ask_size", 0.0))
+            outcomes.append(market.get("title", t)[:60])
+            tickers.append(t)
 
     if any(p < MIN_LEG_PRICE for p in ask_prices):
         return None
@@ -351,10 +321,10 @@ def compute_multi_outcome_opportunity(markets: list, source: str = "REST") -> Op
     if sum_asks >= 1.0:
         return None
 
-    gross_profit = 1.0 - sum_asks
-    total_fees   = FEE_RATE * sum_asks
-    net_profit   = gross_profit - total_fees
-    has_zero_size = any(s <= 0 for s in ask_sizes)
+    gross_profit   = 1.0 - sum_asks
+    total_fees_val = _total_fees(ask_prices)
+    net_profit     = gross_profit - total_fees_val
+    has_zero_size  = any(s <= 0 for s in ask_sizes)
 
     if net_profit >= MIN_NET_PROFIT and all(s >= MIN_LEG_SIZE for s in ask_sizes):
         category = "opportunity"
@@ -363,39 +333,32 @@ def compute_multi_outcome_opportunity(markets: list, source: str = "REST") -> Op
     else:
         return None
 
-    # Use the shared event_id as the condition_id key; label as multi-way.
-    event_id = markets[0].get("event_id") or markets[0]["condition_id"]
-    question  = f"[{len(markets)}-way event] {markets[0]['question'][:60]}"
-    end_date_iso = markets[0].get("end_date_iso", "") if category == "opportunity" else None
+    event_ticker = markets[0].get("event_ticker") or markets[0]["ticker"]
+    title = f"[{len(markets)}-way] {markets[0]['title'][:60]}"
+    close_time = markets[0].get("close_time", "") if category == "opportunity" else None
 
     return {
-        "condition_id": event_id,
-        "question":     question,
-        "token_ids":    token_ids,
-        "outcomes":     outcomes,
-        "ask_prices":   ask_prices,
-        "ask_sizes":    ask_sizes,
-        "sum_asks":     sum_asks,
-        "gross_profit": gross_profit,
-        "total_fees":   total_fees,
-        "net_profit":   net_profit,
-        "fee_rate":     FEE_RATE,
-        "source":       source,
-        "category":     category,
-        "has_zero_size": has_zero_size,
-        "end_date_iso": end_date_iso,
+        "ticker":          event_ticker,
+        "event_ticker":    event_ticker,
+        "title":           title,
+        "outcomes":        outcomes,
+        "ask_prices":      ask_prices,
+        "ask_sizes":       ask_sizes,
+        "sum_asks":        sum_asks,
+        "gross_profit":    gross_profit,
+        "total_fees":      total_fees_val,
+        "net_profit":      net_profit,
+        "taker_fee_coeff": TAKER_FEE_COEFF,
+        "source":          source,
+        "category":        category,
+        "has_zero_size":   has_zero_size,
+        "close_time":      close_time,
     }
 
 
 def scan_all_markets(source: str = "REST") -> list[dict]:
-    """
-    Check every tracked market/event for arb and return all opportunities.
-
-    Routes each group to the correct compute function:
-      • 1 market  per event_id → standalone binary (YES + NO check)
-      • N markets per event_id → multi-outcome event (sum of YES asks check)
-    """
-    groups = _group_by_event(list(markets_by_condition.values()))
+    """Check every tracked market/event for arb and return all results."""
+    groups = _group_by_event(list(markets_by_ticker.values()))
     opps = []
     for event_markets in groups.values():
         if len(event_markets) == 1:
@@ -415,37 +378,33 @@ def execute_arb(opp: dict[str, Any]) -> None:
     """
     PHASE 2 STUB
     ────────────
-    Wire actual order placement here.  The opportunity dict contains everything
-    needed: token_ids, ask_prices, ask_sizes, condition_id, etc.
+    Wire actual order placement here.
 
-    Steps to implement:
-      1. Derive / load L2 API credentials from config (POLY_ADDRESS, POLY_API_KEY, …)
-      2. For each (token_id, ask_price) in opp["token_ids"]:
-             POST /order  {token_id, price, size, side="BUY", order_type="FOK"}
-      3. Handle partial fills, cancellations, and position tracking
-      4. Emit a fill event back to the alerter
-
-    The py-clob-client library (pip install py-clob-client) provides a
-    ready-made client.ClobClient that handles EIP-712 signing and L2 headers.
+    Steps:
+      1. Load KALSHI_API_KEY_ID + KALSHI_PRIVATE_KEY_PATH from config
+      2. For each (ticker, ask_price, side) in opp:
+             POST /portfolio/orders  {ticker, action="buy", side, count, price, type="limit"}
+      3. Handle fills, rejections, position tracking
+      4. Emit fill event back to alerter
     """
     logger.info(
         "[PHASE 2 STUB] Would execute arb on %s (net profit %.3f%%)",
-        opp["condition_id"],
+        opp["ticker"],
         opp["net_profit"] * 100,
     )
-    # TODO: implement execution
 
 
-
+# ---------------------------------------------------------------------------
+# Alert helpers
+# ---------------------------------------------------------------------------
 
 def _fire_rest_alert(result: dict, row_id: int) -> None:
-    """Emit the appropriate alert for a REST-detected opportunity or near-miss."""
     if result["category"] == "opportunity":
         if result["has_zero_size"]:
             logger.debug("Opportunity #%d  net=%.3f%%  [zero-size, suppressed]",
                          row_id, result["net_profit"] * 100)
             return
-        mins = _minutes_to_close(result.get("end_date_iso"))
+        mins = _minutes_to_close(result.get("close_time"))
         if mins is not None and mins < EXPIRING_SOON_MINS:
             if (5 <= mins < EXPIRING_SOON_MINS
                     and result["net_profit"] >= EXPIRING_ACTIONABLE_MIN_PROFIT
@@ -459,7 +418,7 @@ def _fire_rest_alert(result: dict, row_id: int) -> None:
         else:
             alert(result)
             logger.info("Opportunity #%d  net=%.3f%%", row_id, result["net_profit"] * 100)
-    else:  # near_miss
+    else:
         alert_near_miss(result)
         logger.info("Near-miss  #%d  gross=%.3f%%  net=%.3f%%  (fees ate the spread)",
                     row_id, result["gross_profit"] * 100, result["net_profit"] * 100)
@@ -469,48 +428,42 @@ def _rest_handle_result(result: dict) -> None:
     """
     Deduplicate REST scan results.
 
-    DB logic (rest_state — REST-only):
-      First detection  → INSERT row, record row_id + sum_asks.
-      Same prices      → skip entirely (no DB write, no alert check).
-      Prices changed   → UPDATE existing row in place; proceed to alert check.
-
-    Alert logic (alert_cooldown — shared with WS):
-      Suppressed if another source (REST or WS) alerted within
-      WS_ALERT_COOLDOWN_SECS AND profit hasn't improved by WS_MIN_PROFIT_IMPROVEMENT.
+    DB (rest_state): first detection → INSERT; same prices → skip;
+                     prices changed → UPDATE in-place.
+    Alert (alert_cooldown): shared with WS; suppressed within cooldown window
+                            unless profit improved by WS_MIN_PROFIT_IMPROVEMENT.
     """
-    cid = result["condition_id"]
+    key = result["ticker"]
     now = datetime.now(timezone.utc)
 
     with rest_state_lock:
-        state = rest_state.get(cid)
+        state = rest_state.get(key)
 
-    # ── DB: insert or update ─────────────────────────────────────────────────
     if state is not None and abs(result["sum_asks"] - state["sum_asks"]) < 0.0001:
-        return  # price unchanged — skip entirely
+        return  # price unchanged
 
     if state is None:
         row_id = save_opportunity(result)
         with rest_state_lock:
-            rest_state[cid] = {"row_id": row_id, "sum_asks": result["sum_asks"]}
+            rest_state[key] = {"row_id": row_id, "sum_asks": result["sum_asks"]}
     else:
         update_opportunity(state["row_id"], result)
         row_id = state["row_id"]
         with rest_state_lock:
-            rest_state[cid]["sum_asks"] = result["sum_asks"]
+            rest_state[key]["sum_asks"] = result["sum_asks"]
 
-    # ── WS priority: promote opportunity tokens for real-time tracking ───────
+    # WS priority: promote opportunity tickers for real-time tracking
     if result["category"] == "opportunity":
-        _prioritize_opportunity_tokens(result["token_ids"])
+        _prioritize_opportunity_tickers([result["ticker"]])
 
-    # ── Alert: check shared cooldown ─────────────────────────────────────────
     with alert_cooldown_lock:
-        rec = alert_cooldown.get(cid)
+        rec = alert_cooldown.get(key)
         if rec is not None:
             secs_elapsed       = (now - rec["last_alert_at"]).total_seconds()
             profit_improvement = result["net_profit"] - rec["last_net_profit"]
             if secs_elapsed < WS_ALERT_COOLDOWN_SECS and profit_improvement < WS_MIN_PROFIT_IMPROVEMENT:
-                return  # cooldown still active (may have been set by WS)
-        alert_cooldown[cid] = {"last_alert_at": now, "last_net_profit": result["net_profit"]}
+                return
+        alert_cooldown[key] = {"last_alert_at": now, "last_net_profit": result["net_profit"]}
 
     _fire_rest_alert(result, row_id)
 
@@ -521,133 +474,116 @@ def _rest_handle_result(result: dict) -> None:
 
 def rest_poll_loop(stop_event: threading.Event) -> None:
     """
-    Continuously poll order books via REST and update live_prices.
+    Continuously refresh market prices via REST and scan for opportunities.
 
-    Option C — rolling-chunk with WS-skip
-    ──────────────────────────────────────
-    Each cycle:
-      1. Identify "cold" markets: no WS price event in the last WS_FRESHNESS_SECS.
-      2. Take a rolling slice of MAX_REST_MARKETS cold markets (wrapping around).
-      3. Poll only that slice — WS-fresh markets are already up-to-date.
-
-    This lets the REST budget cover all cold markets over successive cycles while
-    WS-active markets stay current without wasting REST calls on them.
+    Option C — rolling chunk with WS-skip:
+      Each cycle takes a rolling slice of MAX_REST_MARKETS cold markets
+      (those not recently updated by WS) and batch-refreshes their prices
+      via GET /markets?tickers=...
     """
     global _rest_chunk_start
     logger.info("REST polling loop started (interval=%.0fs, freshness=%ds)",
                 REST_POLL_INTERVAL, WS_FRESHNESS_SECS)
+
     while not stop_event.is_set():
         now_dt = datetime.now(timezone.utc)
-        all_markets = list(markets_by_condition.values())
+        all_markets = list(markets_by_ticker.values())
         n_total = len(all_markets)
 
         # ── Identify cold markets ────────────────────────────────────────────
         with ws_activity_lock:
-            fresh_conds = {
-                cid for cid, last in ws_activity.items()
+            fresh = {
+                t for t, last in ws_activity.items()
                 if (now_dt - last).total_seconds() <= WS_FRESHNESS_SECS
             }
-        cold_markets = [m for m in all_markets if m["condition_id"] not in fresh_conds]
-        total_cold = len(cold_markets)
-        n_ws_fresh = n_total - total_cold
+        cold_markets = [m for m in all_markets if m["ticker"] not in fresh]
+        total_cold   = len(cold_markets)
+        n_ws_fresh   = n_total - total_cold
 
         # ── Rolling chunk ────────────────────────────────────────────────────
         if total_cold > 0:
-            chunk_idx = _rest_chunk_start % total_cold
-            end = chunk_idx + MAX_REST_MARKETS
+            chunk_idx  = _rest_chunk_start % total_cold
+            end        = chunk_idx + MAX_REST_MARKETS
             if end <= total_cold:
                 poll_markets = cold_markets[chunk_idx:end]
             else:
-                # Wrap around the cold list
                 poll_markets = cold_markets[chunk_idx:] + cold_markets[:end - total_cold]
             _rest_chunk_start = end % total_cold
-            chunk_num = chunk_idx // MAX_REST_MARKETS + 1
+            chunk_num    = chunk_idx // MAX_REST_MARKETS + 1
             total_chunks = max(1, math.ceil(total_cold / MAX_REST_MARKETS))
         else:
-            poll_markets = []
+            poll_markets  = []
             _rest_chunk_start = 0
-            chunk_num = 0
+            chunk_num    = 0
             total_chunks = 0
 
-        token_ids = list({
-            t.get("token_id") or t.get("tokenId", "")
-            for m in poll_markets
-            for t in m["tokens"]
-        })
-        if not token_ids:
+        tickers = [m["ticker"] for m in poll_markets]
+        if not tickers:
             stop_event.wait(REST_POLL_INTERVAL)
             continue
 
         try:
-            books = fetch_order_books(token_ids)
+            prices = fetch_market_prices(tickers)
         except Exception as exc:
-            logger.error("REST book fetch error: %s", exc)
+            logger.error("REST price fetch error: %s", exc)
             stop_event.wait(REST_POLL_INTERVAL)
             continue
 
         with prices_lock:
-            for tid, book in books.items():
-                price, size = best_ask(book)
-                # Always overwrite — including None — to clear stale Gamma seed prices.
-                # None means the /books response had an empty asks array (no live book).
-                live_prices[tid] = {"price": price, "size": size}
+            for ticker, p in prices.items():
+                live_prices[ticker] = p
 
         # ── WS coverage metrics (last 60 s) ──────────────────────────────────
         cutoff = now_dt.timestamp() - 60.0
         with ws_activity_lock:
-            # Prune entries older than 60 s from the left of the deque
             while ws_event_log and ws_event_log[0][0].timestamp() < cutoff:
                 ws_event_log.popleft()
             ws_events_60s = len(ws_event_log)
-            ws_unique_60s = len({cid for _, cid in ws_event_log})
+            ws_unique_60s = len({t for _, t in ws_event_log})
 
-        # ── Scan summary ────────────────────────────────────────────────────
-        n_polled = len(poll_markets)
-        n_resolved = 0    # end_date > 10 min in the past
-        n_full_book = 0   # all legs have a non-None ask price
-        n_no_book = 0     # at least one leg returned empty asks from /books
-        n_underround = 0  # sum of asks < 1.0 (regardless of profit threshold)
-        underround_markets: list[tuple[str, float]] = []  # (question, net_profit)
-        resolved_to_evict: list[str] = []  # condition_ids to remove from cache
+        # ── Scan summary ─────────────────────────────────────────────────────
+        n_polled     = len(poll_markets)
+        n_resolved   = 0
+        n_full_book  = 0
+        n_no_book    = 0
+        n_underround = 0
+        underround_markets: list[tuple[str, float]] = []
+        resolved_to_evict: list[str] = []
 
         with prices_lock:
-            for market in markets_by_condition.values():
-                mins_left = _minutes_to_close(market.get("end_date_iso"))
+            for market in markets_by_ticker.values():
+                mins_left = _minutes_to_close(market.get("close_time"))
                 if mins_left is not None and mins_left < -10:
                     n_resolved += 1
-                    resolved_to_evict.append(market["condition_id"])
+                    resolved_to_evict.append(market["ticker"])
                     continue
-                tids = [t.get("token_id") or t.get("tokenId", "") for t in market["tokens"]]
-                entries = [live_prices.get(tid) for tid in tids]
-                if not all(entries):
-                    continue  # never polled
-                if any(e["price"] is None for e in entries):
+                entry = live_prices.get(market["ticker"])
+                if not entry:
+                    continue
+                if entry.get("yes_ask") is None or entry.get("no_ask") is None:
                     n_no_book += 1
                     continue
                 n_full_book += 1
-                s = sum(e["price"] for e in entries)
+                s = entry["yes_ask"] + entry["no_ask"]
                 if s < 1.0:
                     n_underround += 1
-                    net = 1.0 - (1.0 + FEE_RATE) * s
-                    underround_markets.append((market["question"], net))
+                    fees = _total_fees([entry["yes_ask"], entry["no_ask"]])
+                    net  = 1.0 - s - fees
+                    underround_markets.append((market["title"], net))
 
-        # Evict resolved markets and clean up all associated state.
-        for cid in resolved_to_evict:
-            evicted = markets_by_condition.pop(cid, None)
+        # Evict resolved markets
+        for t in resolved_to_evict:
+            markets_by_ticker.pop(t, None)
             with alert_cooldown_lock:
-                alert_cooldown.pop(cid, None)
+                alert_cooldown.pop(t, None)
             with rest_state_lock:
-                rest_state.pop(cid, None)
+                rest_state.pop(t, None)
             with ws_activity_lock:
-                ws_activity.pop(cid, None)
-            if evicted:
-                tids = [t.get("token_id") or t.get("tokenId", "") for t in evicted.get("tokens", [])]
-                with prices_lock:
-                    for tid in tids:
-                        live_prices.pop(tid, None)
-                with priority_lock:
-                    for tid in tids:
-                        priority_token_ids.discard(tid)
+                ws_activity.pop(t, None)
+            with prices_lock:
+                live_prices.pop(t, None)
+            with priority_lock:
+                priority_tickers.discard(t)
 
         if underround_markets:
             sub_detail = "  ".join(
@@ -682,8 +618,8 @@ def rest_poll_loop(stop_event: threading.Event) -> None:
 
 def ws_event_loop(event_queue: queue.Queue, stop_event: threading.Event) -> None:
     """
-    Consume events from the WebSocket queue, update live_prices, and
-    immediately scan for opportunities when a price changes.
+    Consume Kalshi ticker events from the WS queue, update live_prices,
+    and immediately scan affected markets for arb opportunities.
     """
     logger.info("WebSocket event loop started")
     while not stop_event.is_set():
@@ -692,51 +628,49 @@ def ws_event_loop(event_queue: queue.Queue, stop_event: threading.Event) -> None
         except queue.Empty:
             continue
 
-        event_type = event.get("event_type") or event.get("type", "")
-        token_id = event.get("asset_id") or event.get("token_id") or event.get("market", "")
+        msg_type = event.get("type", "")
 
-        if event_type == "price_change":
-            # Single price update
-            price = event.get("price")
-            size = event.get("size", event.get("amount", 0))
-            if token_id and price is not None:
-                with prices_lock:
-                    live_prices[token_id] = {"price": float(price), "size": float(size)}
-                _check_token_markets(token_id, source="WS")
+        if msg_type == "ticker":
+            msg = event.get("msg", {})
+            ticker = msg.get("market_ticker", "")
+            if not ticker:
+                continue
 
-        elif event_type in ("book", "orderbook"):
-            # Full order book snapshot
-            if token_id:
-                asks = event.get("asks") or event.get("sells", [])
-                if asks:
-                    best_entry = min(asks, key=lambda a: float(a["price"]) if isinstance(a, dict) else float(a[0]))
-                    if isinstance(best_entry, dict):
-                        ws_price = float(best_entry.get("price", best_entry.get("p", 0)))
-                        ws_size = float(best_entry.get("size", best_entry.get("s", 0)))
-                    else:
-                        ws_price, ws_size = float(best_entry[0]), float(best_entry[1])
-                    with prices_lock:
-                        live_prices[token_id] = {"price": ws_price, "size": ws_size}
-                    _check_token_markets(token_id, source="WS")
-                else:
-                    # Empty asks from WS — clear any stale price for this token
-                    with prices_lock:
-                        live_prices[token_id] = {"price": None, "size": 0.0}
+            yes_ask = _parse_ws_price(msg.get("yes_ask_dollars") or msg.get("yes_ask"))
+            no_ask  = _parse_ws_price(msg.get("no_ask_dollars")  or msg.get("no_ask"))
 
-        elif event_type == "last_trade_price":
-            # Not used for arb detection but could seed initial prices
-            pass
+            if yes_ask is None and no_ask is None:
+                continue  # no price info in this tick
+
+            with prices_lock:
+                entry = live_prices.get(ticker, {})
+                # Only update fields that are present in this message
+                if yes_ask is not None:
+                    entry["yes_ask"]      = yes_ask
+                    entry["yes_ask_size"] = float(msg.get("yes_ask_size_fp") or msg.get("yes_ask_size") or entry.get("yes_ask_size", 0))
+                if no_ask is not None:
+                    entry["no_ask"]      = no_ask
+                    entry["no_ask_size"] = float(msg.get("no_ask_size_fp") or msg.get("no_ask_size") or entry.get("no_ask_size", 0))
+                live_prices[ticker] = entry
+
+            _check_ticker_market(ticker, source="WS")
 
     logger.info("WebSocket event loop stopped")
 
 
-def _minutes_to_close(end_date_iso: Optional[str]) -> Optional[float]:
-    """Return minutes until market closes, or None if end_date is absent/unparseable."""
-    if not end_date_iso:
+def _parse_ws_price(val) -> Optional[float]:
+    try:
+        f = float(val)
+        return f if f > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _minutes_to_close(close_time: Optional[str]) -> Optional[float]:
+    if not close_time:
         return None
     try:
-        normalized = end_date_iso.replace("Z", "+00:00")
-        end_dt = datetime.fromisoformat(normalized)
+        end_dt = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
         if end_dt.tzinfo is None:
             end_dt = end_dt.replace(tzinfo=timezone.utc)
         return (end_dt - datetime.now(timezone.utc)).total_seconds() / 60
@@ -744,60 +678,37 @@ def _minutes_to_close(end_date_iso: Optional[str]) -> Optional[float]:
         return None
 
 
-def _ws_should_alert(condition_id: str, net_profit: float) -> bool:
-    """
-    Return True if this market is eligible for a WS alert.
-
-    Uses the shared alert_cooldown so REST and WS never double-alert the same
-    market within WS_ALERT_COOLDOWN_SECS regardless of which thread fired first.
-    Updates the record when returning True.
-    """
+def _ws_should_alert(key: str, net_profit: float) -> bool:
     now = datetime.now(timezone.utc)
     with alert_cooldown_lock:
-        rec = alert_cooldown.get(condition_id)
+        rec = alert_cooldown.get(key)
         if rec is not None:
-            secs_elapsed = (now - rec["last_alert_at"]).total_seconds()
+            secs_elapsed       = (now - rec["last_alert_at"]).total_seconds()
             profit_improvement = net_profit - rec["last_net_profit"]
             if secs_elapsed < WS_ALERT_COOLDOWN_SECS and profit_improvement < WS_MIN_PROFIT_IMPROVEMENT:
                 return False
-        alert_cooldown[condition_id] = {"last_alert_at": now, "last_net_profit": net_profit}
+        alert_cooldown[key] = {"last_alert_at": now, "last_net_profit": net_profit}
     return True
 
 
-def _check_token_markets(token_id: str, source: str) -> None:
+def _check_ticker_market(ticker: str, source: str) -> None:
     """
-    Find all markets containing token_id and scan them for arb / near-miss.
-
-    WS deduplication
-    ─────────────────
-    Each binary market has two tokens; a single price update fires this
-    function twice (once per token).  The cooldown is keyed on condition_id
-    so both token events count as one.
-
-    Expiry classification (opportunities only, after cooldown check)
-    ──────────────────────────────────────────────────────────────────
-    EXPIRING (<30 min)            → save to DB, suppress console
-    EXPIRING_ACTIONABLE (5-30 min, net >1%, size >$50) → dedicated alert
-    Normal                        → standard alert
+    Find the event group containing this ticker and scan it for arb.
+    Records WS activity for REST-skip logic.
     """
-    # Find the event group(s) affected by this token update, then run the
-    # correct compute function for each affected event.
-    all_markets = list(markets_by_condition.values())
+    all_markets = list(markets_by_ticker.values())
     groups = _group_by_event(all_markets)
 
-    # Identify which event keys contain this token.
     affected_keys: set[str] = set()
     for key, event_markets in groups.items():
         for m in event_markets:
-            ids = [t.get("token_id") or t.get("tokenId", "") for t in m["tokens"]]
-            if token_id in ids:
-                # Record WS activity on the individual condition so REST skipping works.
+            if m["ticker"] == ticker:
                 _now = datetime.now(timezone.utc)
                 with ws_activity_lock:
-                    ws_activity[m["condition_id"]] = _now
-                    ws_event_log.append((_now, m["condition_id"]))
+                    ws_activity[ticker] = _now
+                    ws_event_log.append((_now, ticker))
                 affected_keys.add(key)
-                break  # one match per group is enough
+                break
 
     for key in affected_keys:
         event_markets = groups[key]
@@ -809,25 +720,21 @@ def _check_token_markets(token_id: str, source: str) -> None:
         if not result:
             continue
 
-        cond_id = result["condition_id"]
+        k = result["ticker"]
 
         if result["category"] == "opportunity":
             if result["has_zero_size"]:
-                # Save silently; not fillable
                 save_opportunity(result)
-                logger.debug("WS opportunity [zero-size suppressed]  cond=...%s  net=%.3f%%",
-                             cond_id[-8:], result["net_profit"] * 100)
+                logger.debug("WS opportunity [zero-size suppressed]  ticker=%s  net=%.3f%%",
+                             k, result["net_profit"] * 100)
                 continue
 
-            if not _ws_should_alert(cond_id, result["net_profit"]):
-                # Cooldown active — price updated in memory but no alert/save
-                logger.debug("WS cooldown hit  cond=...%s  net=%.3f%%",
-                             cond_id[-8:], result["net_profit"] * 100)
+            if not _ws_should_alert(k, result["net_profit"]):
+                logger.debug("WS cooldown hit  ticker=%s  net=%.3f%%", k, result["net_profit"] * 100)
                 continue
 
             row_id = save_opportunity(result)
-
-            mins = _minutes_to_close(result.get("end_date_iso"))
+            mins = _minutes_to_close(result.get("close_time"))
             if mins is not None and mins < EXPIRING_SOON_MINS:
                 if (5 <= mins < EXPIRING_SOON_MINS
                         and result["net_profit"] >= EXPIRING_ACTIONABLE_MIN_PROFIT
@@ -841,11 +748,10 @@ def _check_token_markets(token_id: str, source: str) -> None:
             else:
                 alert(result)
                 logger.info("WS opportunity #%d  net=%.3f%%", row_id, result["net_profit"] * 100)
-                # execute_arb(result)
 
         else:  # near_miss
-            if not _ws_should_alert(cond_id, result["net_profit"]):
-                logger.debug("WS cooldown hit (near-miss)  cond=...%s", cond_id[-8:])
+            if not _ws_should_alert(k, result["net_profit"]):
+                logger.debug("WS cooldown hit (near-miss)  ticker=%s", k)
                 continue
             row_id = save_opportunity(result)
             alert_near_miss(result)
@@ -856,62 +762,51 @@ def _check_token_markets(token_id: str, source: str) -> None:
 # Market refresh loop
 # ---------------------------------------------------------------------------
 
-def market_refresh_loop(ws_client: Optional[PolymarketWSClient], stop_event: threading.Event) -> None:
-    """Periodically re-fetch the active market list and update subscriptions."""
+def market_refresh_loop(ws_client: Optional[KalshiWSClient], stop_event: threading.Event) -> None:
+    """Periodically re-fetch the active market list and update WS subscriptions."""
     logger.info("Market refresh loop started (interval=%.0fs)", MARKET_REFRESH_INTERVAL)
     while not stop_event.is_set():
         try:
             markets = fetch_active_markets()
-            new_conds: dict[str, dict] = {}
-            for m in markets:
-                new_conds[m["condition_id"]] = m
+            new_tickers: dict[str, dict] = {m["ticker"]: m for m in markets}
 
-            # Atomic swap: add/update new markets first, then remove old ones.
-            # Never leave markets_by_condition empty — a clear() + update() gap
-            # would cause scan_all_markets() to return [] and wrongly invalidate
-            # alert_cooldown/rest_state entries.
-            markets_by_condition.update(new_conds)
-            for k in list(markets_by_condition):
-                if k not in new_conds:
-                    evicted = markets_by_condition.pop(k, None)
+            # Atomic swap: add/update first, then remove evicted
+            markets_by_ticker.update(new_tickers)
+            for t in list(markets_by_ticker):
+                if t not in new_tickers:
+                    markets_by_ticker.pop(t, None)
                     with alert_cooldown_lock:
-                        alert_cooldown.pop(k, None)
+                        alert_cooldown.pop(t, None)
                     with rest_state_lock:
-                        rest_state.pop(k, None)
+                        rest_state.pop(t, None)
                     with ws_activity_lock:
-                        ws_activity.pop(k, None)
-                    if evicted:
-                        tids = [t.get("token_id") or t.get("tokenId", "") for t in evicted.get("tokens", [])]
-                        with prices_lock:
-                            for tid in tids:
-                                live_prices.pop(tid, None)
-                        with priority_lock:
-                            for tid in tids:
-                                priority_token_ids.discard(tid)
+                        ws_activity.pop(t, None)
+                    with prices_lock:
+                        live_prices.pop(t, None)
+                    with priority_lock:
+                        priority_tickers.discard(t)
 
-            # Seed live_prices from Gamma's outcomePrices so every market has
-            # an initial price before the first REST poll / WS event arrives.
-            # These are mid-prices so use a placeholder size of 0 (liquidity
-            # filter will exclude them until real order-book data arrives).
+            # Seed live_prices from market listing (size=0 until real book data arrives)
             with prices_lock:
                 for m in markets:
-                    for tid, p in m.get("seed_prices", {}).items():
-                        if tid not in live_prices:
-                            live_prices[tid] = {"price": p, "size": 0.0}
+                    t = m["ticker"]
+                    if t not in live_prices:
+                        live_prices[t] = {
+                            "yes_ask":      m.get("seed_yes_ask"),
+                            "yes_ask_size": m.get("seed_yes_ask_size", 0.0),
+                            "no_ask":       m.get("seed_no_ask"),
+                            "no_ask_size":  m.get("seed_no_ask_size", 0.0),
+                        }
 
             if ws_client:
-                all_token_ids = list({
-                    t.get("token_id") or t.get("tokenId", "")
-                    for m in markets_by_condition.values()
-                    for t in m["tokens"]
-                })
-                # Priority tokens first so they survive the MAX_WS_TOKENS cap.
+                all_t = list(markets_by_ticker.keys())
+                all_t_set = set(all_t)
                 with priority_lock:
-                    pri = [t for t in priority_token_ids if t in set(all_token_ids)]
-                remaining = [t for t in all_token_ids if t not in priority_token_ids]
+                    pri = [t for t in priority_tickers if t in all_t_set]
+                remaining = [t for t in all_t if t not in priority_tickers]
                 ws_client.update_subscriptions(pri + remaining)
 
-            logger.info("Market list updated: %d markets tracked", len(markets_by_condition))
+            logger.info("Market list updated: %d markets tracked", len(markets_by_ticker))
             _log_market_composition()
 
         except Exception as exc:
@@ -927,25 +822,21 @@ def market_refresh_loop(ws_client: Optional[PolymarketWSClient], stop_event: thr
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Polymarket Arbitrage Bot")
+    parser = argparse.ArgumentParser(description="Kalshi Arbitrage Bot")
     parser.add_argument("--no-ws", action="store_true", help="Disable WebSocket, use REST-only")
     parser.add_argument(
         "--debug-mode",
         action="store_true",
-        help=(
-            "Log ALL sub-100%% books (sets min_net_profit=-5%% and min_leg_size=0). "
-            "Use to verify the pipeline end-to-end before tightening thresholds."
-        ),
+        help="Log ALL sub-100%% books (sets min_net_profit=-5%% and min_leg_size=0).",
     )
     args = parser.parse_args()
 
     if args.debug_mode:
         global MIN_NET_PROFIT, MIN_LEG_SIZE
-        MIN_NET_PROFIT = -0.05   # surface everything, even overrounds
-        MIN_LEG_SIZE = 0.0
+        MIN_NET_PROFIT = -0.05
+        MIN_LEG_SIZE   = 0.0
         logger.warning(
-            "DEBUG MODE active — min_net_profit=%.0f%%  min_leg_size=%.1f  "
-            "(all sub-100%% books will be logged regardless of profit)",
+            "DEBUG MODE active — min_net_profit=%.0f%%  min_leg_size=%.1f",
             MIN_NET_PROFIT * 100, MIN_LEG_SIZE,
         )
 
@@ -959,39 +850,36 @@ def main() -> None:
         logger.info("Shutdown signal received, stopping …")
         stop_event.set()
 
-    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGINT,  _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    # Initial market load (blocking — must succeed before any scan)
     logger.info("Loading initial market list …")
     try:
         markets = fetch_active_markets()
         for m in markets:
-            markets_by_condition[m["condition_id"]] = m
-            for tid, p in m.get("seed_prices", {}).items():
-                live_prices[tid] = {"price": p, "size": 0.0}
-        logger.info("Loaded %d markets", len(markets_by_condition))
+            markets_by_ticker[m["ticker"]] = m
+            live_prices[m["ticker"]] = {
+                "yes_ask":      m.get("seed_yes_ask"),
+                "yes_ask_size": m.get("seed_yes_ask_size", 0.0),
+                "no_ask":       m.get("seed_no_ask"),
+                "no_ask_size":  m.get("seed_no_ask_size", 0.0),
+            }
+        logger.info("Loaded %d markets", len(markets_by_ticker))
         _log_market_composition()
     except Exception as exc:
         logger.critical("Failed to load initial markets: %s", exc)
         sys.exit(1)
 
-    ws_client: Optional[PolymarketWSClient] = None
+    ws_client: Optional[KalshiWSClient] = None
     event_queue: queue.Queue = queue.Queue()
-
     threads: list[threading.Thread] = []
 
-    # WebSocket setup
     global _ws_client
     if not args.no_ws:
-        all_token_ids = list({
-            t.get("token_id") or t.get("tokenId", "")
-            for m in markets_by_condition.values()
-            for t in m["tokens"]
-        })
-        ws_client = PolymarketWSClient(event_queue)
-        _ws_client = ws_client  # expose to REST thread for priority subscription updates
-        ws_client.start(all_token_ids)
+        all_tickers = list(markets_by_ticker.keys())
+        ws_client  = KalshiWSClient(event_queue)
+        _ws_client = ws_client
+        ws_client.start(all_tickers)
 
         ws_loop = threading.Thread(
             target=ws_event_loop,
@@ -1004,7 +892,6 @@ def main() -> None:
     else:
         logger.info("WebSocket disabled — REST-only mode")
 
-    # REST polling
     rest_thread = threading.Thread(
         target=rest_poll_loop,
         args=(stop_event,),
@@ -1014,7 +901,6 @@ def main() -> None:
     rest_thread.start()
     threads.append(rest_thread)
 
-    # Market refresh
     refresh_thread = threading.Thread(
         target=market_refresh_loop,
         args=(ws_client, stop_event),
@@ -1026,13 +912,12 @@ def main() -> None:
 
     logger.info(
         "Bot running. Press Ctrl+C to stop. "
-        "WebSocket=%s  FeeRate=%.1f%%  MinProfit=%.2f%%",
+        "WebSocket=%s  TakerFeeCoeff=%.4f  MinProfit=%.2f%%",
         not args.no_ws,
-        FEE_RATE * 100,
+        TAKER_FEE_COEFF,
         MIN_NET_PROFIT * 100,
     )
 
-    # Block until shutdown
     stop_event.wait()
     if ws_client:
         ws_client.stop()

@@ -1,5 +1,5 @@
 """
-All tunable parameters for the Polymarket arbitrage bot.
+All tunable parameters for the Kalshi arbitrage bot.
 Values are loaded from environment variables (via .env) with sane defaults.
 """
 
@@ -8,100 +8,75 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── API endpoints ────────────────────────────────────────────────────────────
-CLOB_BASE_URL = os.getenv("CLOB_BASE_URL", "https://clob.polymarket.com")
-GAMMA_BASE_URL = os.getenv("GAMMA_BASE_URL", "https://gamma-api.polymarket.com")
-WS_URL = os.getenv("WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market")
+# ── API endpoints ─────────────────────────────────────────────────────────────
+KALSHI_BASE_URL = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2")
+KALSHI_WS_URL   = os.getenv("KALSHI_WS_URL",   "wss://api.elections.kalshi.com/trade-api/ws/v2")
 
-# ── Scanning behaviour ───────────────────────────────────────────────────────
-# How often (seconds) to re-fetch market list from Gamma
+# ── Kalshi API credentials ────────────────────────────────────────────────────
+# Generate via Account Settings → API Keys on kalshi.com
+# The private key PEM file is generated locally — Kalshi never stores it.
+KALSHI_API_KEY_ID       = os.getenv("KALSHI_API_KEY_ID", "")
+KALSHI_PRIVATE_KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY_PATH", "kalshi_private_key.pem")
+
+# ── Scanning behaviour ────────────────────────────────────────────────────────
+# How often (seconds) to re-fetch the full market list
 MARKET_REFRESH_INTERVAL = float(os.getenv("MARKET_REFRESH_INTERVAL", "300"))
 
-# How often (seconds) to poll REST order-books for each active market
+# How often (seconds) to run a REST price-refresh cycle
 REST_POLL_INTERVAL = float(os.getenv("REST_POLL_INTERVAL", "10"))
 
-# Maximum markets to track simultaneously (0 = no cap, fetch all)
+# Maximum markets to track simultaneously (0 = no cap)
 MAX_MARKETS = int(os.getenv("MAX_MARKETS", "0"))
 
-# Per-page limit when paginating the Gamma market list
-GAMMA_PAGE_SIZE = int(os.getenv("GAMMA_PAGE_SIZE", "500"))
+# Per-page limit when paginating the Kalshi market list (max 1000)
+MARKET_PAGE_SIZE = int(os.getenv("MARKET_PAGE_SIZE", "1000"))
 
-# Number of markets per batch when fetching order books via REST
-BOOK_BATCH_SIZE = int(os.getenv("BOOK_BATCH_SIZE", "100"))
+# Number of tickers per batch when refreshing prices via GET /markets?tickers=
+BOOK_BATCH_SIZE = int(os.getenv("BOOK_BATCH_SIZE", "200"))
 
-# Sort field for Gamma market list — fetches most active markets first so that
-# if MAX_MARKETS caps the list, the highest-volume markets are prioritised
-GAMMA_SORT_FIELD = os.getenv("GAMMA_SORT_FIELD", "volume24hr")
+# Maximum market tickers to subscribe to via WebSocket
+MAX_WS_MARKETS = int(os.getenv("MAX_WS_MARKETS", "500"))
 
-# Maximum token IDs to subscribe to via WebSocket.
-# Each subscription message is a single JSON frame; ~55k tokens crashes the
-# connection. Keep this well under ~2000 tokens (~1000 binary markets).
-MAX_WS_TOKENS = int(os.getenv("MAX_WS_TOKENS", "1000"))
-
-# Markets that received a WS price event within this many seconds are considered
-# "WS-fresh" and are skipped by the REST poller.  This lets REST cycles focus
-# budget on cold markets not covered by the WebSocket feed.
+# Markets that received a WS update within this many seconds are "WS-fresh"
+# and are skipped by the REST poller
 WS_FRESHNESS_SECS = int(os.getenv("WS_FRESHNESS_SECS", "60"))
 
-# Maximum markets to REST-poll per scan cycle.
-# At 100 tokens/batch that's MAX_REST_MARKETS*2/100 HTTP calls per cycle.
-# 2500 markets → ~50 calls/cycle, comfortably within a 10 s interval.
+# Maximum markets to REST-poll per scan cycle
 MAX_REST_MARKETS = int(os.getenv("MAX_REST_MARKETS", "2500"))
 
-# ── Arbitrage filters ────────────────────────────────────────────────────────
-# Fee rate applied per leg (Polymarket charges ~2 % taker fee)
-FEE_RATE = float(os.getenv("FEE_RATE", "0.02"))
+# ── Fee model (Kalshi parabolic taker fee) ────────────────────────────────────
+# Taker fee per contract = TAKER_FEE_COEFF × price × (1 − price)
+# At $0.50 this equals 1.75¢/contract; approaches 0 near $0.01 or $0.99.
+TAKER_FEE_COEFF = float(os.getenv("TAKER_FEE_COEFF", "0.07"))
 
+# ── Arbitrage filters ─────────────────────────────────────────────────────────
 # Minimum net profit (after fees) as a fraction to surface an opportunity
-# e.g. 0.005 = 0.5 cents per dollar risked
 MIN_NET_PROFIT = float(os.getenv("MIN_NET_PROFIT", "0.005"))
 
-# Minimum liquidity (ask size) required on each leg so the opportunity is
-# actually fillable (in USDC units)
+# Minimum liquidity (contracts × price) required on each leg
 MIN_LEG_SIZE = float(os.getenv("MIN_LEG_SIZE", "50.0"))
 
-# Minimum ask price per leg. Prices below this indicate a near-certain outcome
-# (event already resolved or one side is ~worthless) — not a real inefficiency.
+# Minimum ask price per leg — below this the outcome is near-certain
 MIN_LEG_PRICE = float(os.getenv("MIN_LEG_PRICE", "0.01"))
 
-# Near-miss band: underrounds where fees consume the gross profit, but a maker
-# order (with fee rebate) could flip to profitable.
-# Logged separately; never trigger execution.
-NEAR_MISS_LOWER = float(os.getenv("NEAR_MISS_LOWER", "-0.02"))  # -2 %
+# Near-miss band: underrounds where fees consume the profit
+NEAR_MISS_LOWER = float(os.getenv("NEAR_MISS_LOWER", "-0.02"))
 
-# Net profit threshold above which end_date_iso is logged (high-profit sanity check)
-HIGH_PROFIT_THRESHOLD = float(os.getenv("HIGH_PROFIT_THRESHOLD", "0.05"))  # 5 %
+# Net profit threshold above which close_time is logged for sanity checking
+HIGH_PROFIT_THRESHOLD = float(os.getenv("HIGH_PROFIT_THRESHOLD", "0.05"))
 
-# ── WebSocket alert deduplication ────────────────────────────────────────────
-# Minimum seconds between alerts for the same condition_id
-WS_ALERT_COOLDOWN_SECS = int(os.getenv("WS_ALERT_COOLDOWN_SECS", "60"))
-
-# Minimum net_profit improvement (absolute) required to re-alert after cooldown
-WS_MIN_PROFIT_IMPROVEMENT = float(os.getenv("WS_MIN_PROFIT_IMPROVEMENT", "0.005"))  # 0.5 %
+# ── Alert deduplication ───────────────────────────────────────────────────────
+WS_ALERT_COOLDOWN_SECS    = int(os.getenv("WS_ALERT_COOLDOWN_SECS", "60"))
+WS_MIN_PROFIT_IMPROVEMENT = float(os.getenv("WS_MIN_PROFIT_IMPROVEMENT", "0.005"))
 
 # ── Expiry alerting ───────────────────────────────────────────────────────────
-# Markets closing in less than this many minutes are "expiring" — suppress from
-# normal console output (too late to act without execution wired up)
-EXPIRING_SOON_MINS = int(os.getenv("EXPIRING_SOON_MINS", "30"))
+EXPIRING_SOON_MINS             = int(os.getenv("EXPIRING_SOON_MINS", "30"))
+EXPIRING_ACTIONABLE_MIN_PROFIT = float(os.getenv("EXPIRING_ACTIONABLE_MIN_PROFIT", "0.01"))
 
-# For EXPIRING_ACTIONABLE: only surface if net_profit exceeds this threshold
-EXPIRING_ACTIONABLE_MIN_PROFIT = float(os.getenv("EXPIRING_ACTIONABLE_MIN_PROFIT", "0.01"))  # 1 %
-
-# ── Database ─────────────────────────────────────────────────────────────────
+# ── Database ──────────────────────────────────────────────────────────────────
 DB_PATH = os.getenv("DB_PATH", "arb_opportunities.db")
 
-# ── Alerting ─────────────────────────────────────────────────────────────────
-# Telegram bot token and chat id (leave blank to disable Telegram alerts)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
-# Minimum net profit to fire a Telegram alert (higher threshold reduces noise)
+# ── Alerting ──────────────────────────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_MIN_PROFIT = float(os.getenv("TELEGRAM_MIN_PROFIT", "0.01"))
-
-# ── Phase 2 stub: order execution credentials ────────────────────────────────
-# L2 auth headers required for placing / cancelling orders
-POLY_ADDRESS = os.getenv("POLY_ADDRESS", "")
-POLY_API_KEY = os.getenv("POLY_API_KEY", "")
-POLY_API_SECRET = os.getenv("POLY_API_SECRET", "")
-POLY_API_PASSPHRASE = os.getenv("POLY_API_PASSPHRASE", "")
-PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")   # Only needed for L1 key derivation

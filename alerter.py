@@ -78,8 +78,8 @@ def format_opportunity(opp: dict[str, Any]) -> str:
         f"ARB OPPORTUNITY  [{opp.get('source', 'REST')}]  "
         f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
         "-" * 60,
-        f"Market : {opp['question'][:80]}",
-        f"Cond ID: {opp['condition_id']}",
+        f"Market : {opp['title'][:80]}",
+        f"Ticker : {opp['ticker']}",
         "-" * 60,
         *_leg_lines(opp),
         "-" * 60,
@@ -99,7 +99,7 @@ def format_near_miss(opp: dict[str, Any]) -> str:
         "-" * 60,
         f"NEAR-MISS  [{opp.get('source', 'REST')}]  "
         f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
-        f"Market : {opp['question'][:80]}",
+        f"Market : {opp['title'][:80]}",
         *_leg_lines(opp),
         f"Gross={_fmt_pct(opp['gross_profit'])}  "
         f"Fees={_fmt_pct(opp['total_fees'])}  "
@@ -130,7 +130,7 @@ def alert_telegram(opp: dict[str, Any]) -> None:
     )
     text = (
         f"🤖 *ARB ALERT* [{opp.get('source', 'REST')}]\n"
-        f"*{opp['question'][:100]}*\n\n"
+        f"*{opp['title'][:100]}*\n\n"
         f"{legs}\n\n"
         f"Sum asks: `{opp['sum_asks']:.4f}`\n"
         f"Net profit: `{_fmt_pct(opp['net_profit'])}`"
@@ -161,8 +161,8 @@ def alert_expiring_actionable(opp: dict[str, Any], mins_to_close: float) -> None
         f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
         f"  CLOSES IN {mins_to_close:.0f} MIN  —  NET PROFIT {_fmt_pct(opp['net_profit'])}",
         "-" * 60,
-        f"Market : {opp['question'][:80]}",
-        f"Cond ID: {opp['condition_id']}",
+        f"Market : {opp['title'][:80]}",
+        f"Ticker : {opp['ticker']}",
         "-" * 60,
         legs,
         "-" * 60,

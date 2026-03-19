@@ -29,7 +29,7 @@ TEMPLATE = """<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="refresh" content="30">
-  <title>Polymarket Arb</title>
+  <title>Kalshi Arb</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <style>
     body { font-size: 0.875rem; background: #f8f9fa; }
@@ -46,7 +46,7 @@ TEMPLATE = """<!doctype html>
 
   <!-- Header -->
   <div class="d-flex justify-content-between align-items-center mb-3">
-    <h5 class="mb-0 fw-bold">Polymarket Arb Monitor</h5>
+    <h5 class="mb-0 fw-bold">Kalshi Arb Monitor</h5>
     <span class="text-muted small">auto-refresh 30s &mdash; {{ now }}</span>
   </div>
 
@@ -206,7 +206,7 @@ def _get_rows(category=None, limit: int = 200) -> list:
             legs = []
         rows.append({
             "time_ago":    _time_ago(r["detected_at"]),
-            "question":    r["question"],
+            "question":    r["title"],
             "legs":        legs,
             "sum_asks":    r["sum_asks"],
             "net_profit":  r["net_profit"],

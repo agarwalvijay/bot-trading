@@ -1,12 +1,13 @@
 """
-Data fetching layer.
+Data fetching layer for Kalshi.
 
 Provides:
-  - REST helpers (Gamma market list, CLOB order books)
-  - WebSocket client that streams real-time price updates and feeds them
-    into a thread-safe queue consumed by arb_bot.py
+  - RSA-PSS auth header generation (required for order placement; market data is public)
+  - REST helpers: market listing, batch price refresh via GET /markets?tickers=
+  - WebSocket client streaming real-time ticker updates into a thread-safe queue
 """
 
+import base64
 import json
 import logging
 import queue
@@ -16,20 +17,83 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
 import requests
+
+try:
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+    _CRYPTO_AVAILABLE = True
+except ImportError:
+    _CRYPTO_AVAILABLE = False
+    logging.getLogger(__name__).warning(
+        "cryptography package not installed — authenticated endpoints (order placement) unavailable. "
+        "Run: pip install cryptography"
+    )
+
 import websocket  # websocket-client
 
 from config import (
     BOOK_BATCH_SIZE,
-    CLOB_BASE_URL,
-    GAMMA_BASE_URL,
-    GAMMA_PAGE_SIZE,
-    GAMMA_SORT_FIELD,
+    KALSHI_BASE_URL,
+    KALSHI_WS_URL,
+    KALSHI_API_KEY_ID,
+    KALSHI_PRIVATE_KEY_PATH,
+    MARKET_PAGE_SIZE,
     MAX_MARKETS,
-    MAX_WS_TOKENS,
-    WS_URL,
+    MAX_WS_MARKETS,
 )
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# RSA-PSS auth (required for order placement — not for market data reads)
+# ---------------------------------------------------------------------------
+
+_private_key = None
+
+
+def _load_private_key():
+    global _private_key
+    if _private_key is not None:
+        return _private_key
+    if not _CRYPTO_AVAILABLE:
+        return None
+    try:
+        with open(KALSHI_PRIVATE_KEY_PATH, "rb") as f:
+            _private_key = serialization.load_pem_private_key(f.read(), password=None)
+        logger.info("Kalshi private key loaded from %s", KALSHI_PRIVATE_KEY_PATH)
+        return _private_key
+    except FileNotFoundError:
+        logger.debug("No private key at %s — authenticated endpoints disabled", KALSHI_PRIVATE_KEY_PATH)
+        return None
+    except Exception as exc:
+        logger.warning("Failed to load Kalshi private key: %s", exc)
+        return None
+
+
+def _auth_headers(method: str, path: str) -> dict:
+    """
+    Return KALSHI-ACCESS-* headers for an authenticated request.
+    Signs: {timestamp_ms}{METHOD_UPPER}{path_without_query}
+    """
+    key = _load_private_key()
+    if not key or not KALSHI_API_KEY_ID:
+        return {}
+    ts = str(int(time.time() * 1000))
+    msg = (ts + method.upper() + path).encode("utf-8")
+    sig = key.sign(
+        msg,
+        asym_padding.PSS(
+            mgf=asym_padding.MGF1(hashes.SHA256()),
+            salt_length=asym_padding.PSS.DIGEST_LENGTH,
+        ),
+        hashes.SHA256(),
+    )
+    return {
+        "KALSHI-ACCESS-KEY":       KALSHI_API_KEY_ID,
+        "KALSHI-ACCESS-TIMESTAMP": ts,
+        "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
+    }
+
 
 # ---------------------------------------------------------------------------
 # REST helpers
@@ -39,314 +103,199 @@ SESSION = requests.Session()
 SESSION.headers.update({"Accept": "application/json"})
 
 
-def _get(url: str, params: Optional[dict] = None, retries: int = 3) -> Any:
+def _get(path: str, params: Optional[dict] = None, auth: bool = False, retries: int = 3) -> Any:
     """GET with simple exponential-backoff retry."""
+    url = f"{KALSHI_BASE_URL}{path}"
+    headers = _auth_headers("GET", path) if auth else {}
     for attempt in range(retries):
         try:
-            resp = SESSION.get(url, params=params, timeout=15)
+            resp = SESSION.get(url, params=params, headers=headers, timeout=15)
             resp.raise_for_status()
             return resp.json()
         except requests.HTTPError as exc:
-            logger.warning("HTTP %s on GET %s (attempt %d)", exc.response.status_code, url, attempt + 1)
+            logger.warning("HTTP %s on GET %s (attempt %d)", exc.response.status_code, path, attempt + 1)
             if exc.response.status_code in (429, 503):
                 time.sleep(2 ** attempt)
             else:
                 raise
         except requests.RequestException as exc:
-            logger.warning("Request error on GET %s: %s (attempt %d)", url, exc, attempt + 1)
+            logger.warning("Request error on GET %s: %s (attempt %d)", path, exc, attempt + 1)
             time.sleep(2 ** attempt)
-    raise RuntimeError(f"Failed to GET {url} after {retries} attempts")
+    raise RuntimeError(f"Failed to GET {path} after {retries} attempts")
+
+
+def _parse_price(val) -> Optional[float]:
+    """Parse a Kalshi price field (string or numeric) to float, or None."""
+    try:
+        f = float(val)
+        return f if f > 0 else None
+    except (TypeError, ValueError):
+        return None
 
 
 def fetch_active_markets() -> list[dict]:
     """
-    Return active CLOB markets from the Gamma API.
+    Return all open Kalshi markets via cursor pagination.
 
     Each returned dict contains:
-        condition_id  – unique market identifier
-        question      – human-readable question
-        tokens        – list of {token_id, outcome}
-        seed_prices   – {token_id: best_ask} from Gamma (used to prime live_prices)
+        ticker            – market identifier  (e.g. "FED-25MAR-T4.50")
+        event_ticker      – parent event  (groups sibling outcome markets)
+        title             – human-readable question
+        close_time        – ISO-8601 close datetime
+        seed_yes_ask      – best YES ask price from listing (primes live_prices)
+        seed_no_ask       – best NO ask price
+        seed_yes_ask_size – contracts available at best YES ask
+        seed_no_ask_size  – contracts available at best NO ask
     """
-    global _event_field_sample_logged
     markets: list[dict] = []
-    offset = 0
+    cursor: Optional[str] = None
     page = 0
 
     while True:
-        data = _get(
-            f"{GAMMA_BASE_URL}/markets",
-            params={
-                "active": "true",
-                "closed": "false",
-                "archived": "false",
-                "limit": GAMMA_PAGE_SIZE,
-                "offset": offset,
-                "order": GAMMA_SORT_FIELD,
-                "ascending": "false",
-            },
-        )
+        params: dict = {"status": "open", "limit": MARKET_PAGE_SIZE}
+        if cursor:
+            params["cursor"] = cursor
 
-        # Gamma returns a list directly or {"markets": [...]}
-        batch = data if isinstance(data, list) else data.get("markets", [])
+        data = _get("/markets", params=params)
+        batch = data.get("markets", [])
         page += 1
-        logger.debug("Gamma page %d: %d raw markets (offset=%d)", page, len(batch), offset)
+        logger.debug("Kalshi page %d: %d markets (cursor=%s)", page, len(batch), cursor)
 
         if not batch:
             break
 
         for m in batch:
-            # Skip markets not on the CLOB
-            if not m.get("enableOrderBook") or not m.get("acceptingOrders"):
+            ticker = m.get("ticker", "")
+            if not ticker:
                 continue
 
-            # One-time diagnostic: log all event-related fields from the first market
-            # that has any of them set.  This lets us verify we're reading the right keys.
-            if not _event_field_sample_logged:
-                event_keys = {k: m[k] for k in m if "event" in k.lower() or k in ("groupId", "parentEventId", "parentConditionId")}
-                if event_keys or m.get("eventId"):
-                    logger.info(
-                        "Gamma event-field sample (cond=...%s  q=%s): %s",
-                        str(m.get("conditionId", "?"))[-12:],
-                        m.get("question", "?")[:60],
-                        event_keys,
-                    )
-                    _event_field_sample_logged = True
-
-            # clobTokenIds and outcomes are JSON-encoded strings in the Gamma response
-            raw_token_ids = m.get("clobTokenIds", "[]")
-            raw_outcomes = m.get("outcomes", "[]")
-            try:
-                token_ids = json.loads(raw_token_ids) if isinstance(raw_token_ids, str) else raw_token_ids
-                outcomes = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
-            except (json.JSONDecodeError, TypeError):
-                continue
-
-            if len(token_ids) < 2:
-                continue
-
-            tokens = [
-                {"token_id": tid, "outcome": out}
-                for tid, out in zip(token_ids, outcomes)
-            ]
-
-            # Gamma includes bestAsk per market (single price for binary YES token).
-            # Use outcomePrices to seed both legs when available.
-            seed_prices: dict[str, float] = {}
-            raw_prices = m.get("outcomePrices", "[]")
-            try:
-                prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
-                for tid, p in zip(token_ids, prices):
-                    seed_prices[tid] = float(p)
-            except (json.JSONDecodeError, TypeError, ValueError):
-                pass
-
-            # event_id groups sibling outcome markets (e.g. all legs of an
-            # ECB rate decision event).  Fall back to "" for standalone markets.
-            # Try every field name Gamma has been observed to use.
-            raw_event = m.get("event") or {}
-            event_id = str(
-                m.get("eventId")
-                or m.get("event_id")
-                or m.get("parentEventId")
-                or m.get("groupId")
-                or (raw_event.get("id") if isinstance(raw_event, dict) else None)
-                or (raw_event.get("slug") if isinstance(raw_event, dict) else None)
-                or ""
-            )
+            yes_ask      = _parse_price(m.get("yes_ask_dollars") or m.get("yes_ask"))
+            no_ask       = _parse_price(m.get("no_ask_dollars")  or m.get("no_ask"))
+            yes_ask_size = float(m.get("yes_ask_size_fp") or m.get("yes_ask_size") or 0)
+            no_ask_size  = float(m.get("no_ask_size_fp")  or m.get("no_ask_size")  or 0)
 
             markets.append({
-                "condition_id": m.get("conditionId") or m.get("condition_id", ""),
-                "question": m.get("question", ""),
-                "tokens": tokens,
-                "seed_prices": seed_prices,
-                "end_date_iso": m.get("endDateIso") or m.get("endDate", ""),
-                "event_id": event_id,
+                "ticker":            ticker,
+                "event_ticker":      m.get("event_ticker", ""),
+                "title":             (m.get("title") or m.get("yes_sub_title") or ticker),
+                "close_time":        m.get("close_time") or m.get("expiration_time") or "",
+                "seed_yes_ask":      yes_ask,
+                "seed_no_ask":       no_ask,
+                "seed_yes_ask_size": yes_ask_size,
+                "seed_no_ask_size":  no_ask_size,
             })
 
-        # Stop if last page was smaller than a full page (exhausted)
-        if len(batch) < GAMMA_PAGE_SIZE:
+        cursor = data.get("cursor")
+        if not cursor:
             break
 
-        # Hard cap — only applied when MAX_MARKETS > 0
         if MAX_MARKETS and len(markets) >= MAX_MARKETS:
             break
 
-        offset += GAMMA_PAGE_SIZE
-
     result = markets[:MAX_MARKETS] if MAX_MARKETS else markets
 
-    # Drop markets whose end_date closed more than 1 hour ago.
-    # Gamma's active=true filter is imperfect and often includes recently-resolved
-    # markets, which bloat the tracking dict and waste REST poll budget.
+    # Drop markets that closed more than 1 hour ago
     one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
     live: list[dict] = []
     for m in result:
-        end_iso = m.get("end_date_iso", "")
-        if end_iso:
+        ct = m.get("close_time", "")
+        if ct:
             try:
-                end_dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+                end_dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
                 if end_dt.tzinfo is None:
                     end_dt = end_dt.replace(tzinfo=timezone.utc)
                 if end_dt < one_hour_ago:
-                    continue  # expired — skip
+                    continue
             except (ValueError, AttributeError):
-                pass  # unparseable date — keep the market
+                pass
         live.append(m)
 
     n_expired = len(result) - len(live)
 
-    # Diagnostic: count markets by event_id population, and log sample event objects.
-    n_with_eid = sum(1 for m in live if m.get("event_id"))
-    n_without_eid = len(live) - n_with_eid
-
-    # Group by event_id and find multi-market events (these should NOT be binary-checked)
+    # Diagnostic: event grouping stats
     _eid_counts: dict[str, int] = {}
     for m in live:
-        eid = m.get("event_id", "")
+        eid = m.get("event_ticker", "")
         if eid:
             _eid_counts[eid] = _eid_counts.get(eid, 0) + 1
     n_multi_events  = sum(1 for c in _eid_counts.values() if c > 1)
     n_multi_markets = sum(c for c in _eid_counts.values() if c > 1)
 
     logger.info(
-        "Fetched %d active CLOB markets from Gamma API (%d pages, page_size=%d)"
-        " — dropped %d already-expired | with event_id: %d | without: %d"
-        " | multi-outcome events: %d (%d outcome markets)",
-        len(live), page, GAMMA_PAGE_SIZE, n_expired,
-        n_with_eid, n_without_eid, n_multi_events, n_multi_markets,
+        "Fetched %d open Kalshi markets (%d pages) — dropped %d expired"
+        " | multi-outcome events: %d (%d markets)",
+        len(live), page, n_expired, n_multi_events, n_multi_markets,
     )
     return live
 
 
-_sample_logged = False  # log one raw book response to verify parsing
-_event_field_sample_logged = False  # log one raw Gamma market with event fields
-
-
-def fetch_order_books(token_ids: list[str]) -> dict[str, dict]:
+def fetch_market_prices(tickers: list[str]) -> dict[str, dict]:
     """
-    POST to /books in batches of BOOK_BATCH_SIZE.
+    Batch-refresh best-ask prices for a list of tickers.
 
-    Request body : [{"token_id": "id1"}, {"token_id": "id2"}, ...]
-    Response     : [{"asset_id": "id", "bids": [...], "asks": [...]}, ...]
+    Uses GET /markets?tickers=t1,t2,... which returns current top-of-book
+    prices and sizes without needing individual order book calls.
 
-    Actual sort order (confirmed from live API):
-      bids: ascending by price  → bids[-1] = best bid (highest)
-      asks: descending by price → asks[-1] = best ask (lowest / cheapest)
-
-    Returns mapping  token_id -> book dict
+    Returns: {ticker: {yes_ask, yes_ask_size, no_ask, no_ask_size}}
+    Both ask prices may be None when there is no live offer on that side.
     """
-    global _sample_logged
     results: dict[str, dict] = {}
 
-    for i in range(0, len(token_ids), BOOK_BATCH_SIZE):
-        batch = token_ids[i : i + BOOK_BATCH_SIZE]
+    for i in range(0, len(tickers), BOOK_BATCH_SIZE):
+        batch = tickers[i: i + BOOK_BATCH_SIZE]
         try:
-            resp = SESSION.post(
-                f"{CLOB_BASE_URL}/books",
-                json=[{"token_id": t} for t in batch],
-                timeout=20,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-            if not isinstance(data, list):
-                logger.warning("Unexpected /books response type: %s", type(data))
-                continue
-
-            # Log one sample on the very first successful call to verify parsing
-            if not _sample_logged and data:
-                sample = data[0]
-                bids = sample.get("bids", [])
-                asks = sample.get("asks", [])
-                best_bid_price = max((float(b["price"]) for b in bids), default=None) if bids else None
-                best_ask_price = min((float(a["price"]) for a in asks), default=None) if asks else None
-                logger.info(
-                    "Sample /books response — asset_id=...%s  "
-                    "bids[0]=%s  bids[-1]=%s  asks[0]=%s  asks[-1]=%s  "
-                    "→ best_bid=%.4f  best_ask=%.4f",
-                    sample.get("asset_id", "?")[-12:],
-                    bids[0]["price"] if bids else "—",
-                    bids[-1]["price"] if bids else "—",
-                    asks[0]["price"] if asks else "—",
-                    asks[-1]["price"] if asks else "—",
-                    best_bid_price or 0,
-                    best_ask_price or 0,
-                )
-                _sample_logged = True
-
-            for book in data:
-                tid = book.get("asset_id", "")
-                if tid:
-                    results[tid] = book
-
-        except requests.HTTPError as exc:
-            logger.warning("POST /books HTTP %s for batch starting ...%s", exc.response.status_code, batch[0][-12:])
+            data = _get("/markets", params={"tickers": ",".join(batch), "limit": len(batch)})
+            for m in data.get("markets", []):
+                ticker = m.get("ticker", "")
+                if not ticker:
+                    continue
+                results[ticker] = {
+                    "yes_ask":      _parse_price(m.get("yes_ask_dollars") or m.get("yes_ask")),
+                    "yes_ask_size": float(m.get("yes_ask_size_fp") or m.get("yes_ask_size") or 0),
+                    "no_ask":       _parse_price(m.get("no_ask_dollars")  or m.get("no_ask")),
+                    "no_ask_size":  float(m.get("no_ask_size_fp")  or m.get("no_ask_size")  or 0),
+                }
         except Exception as exc:
-            logger.warning("POST /books error: %s", exc)
+            logger.warning("fetch_market_prices batch error: %s", exc)
 
     return results
-
-
-def best_ask(book: dict) -> tuple:
-    """
-    Return (best_ask_price, size_at_best_ask) from a book dict.
-
-    Returns (None, 0.0) when the ask side is empty — callers must treat
-    None as "no live order book" and NOT fall back to any default price.
-    """
-    asks = book.get("asks", [])
-    if not asks:
-        return None, 0.0
-
-    # Find the entry with the minimum price (cheapest offer to buy from)
-    best = min(asks, key=lambda a: float(a["price"]) if isinstance(a, dict) else float(a[0]))
-    if isinstance(best, dict):
-        price = float(best.get("price", best.get("p", "inf")))
-        size = float(best.get("size", best.get("s", 0)))
-    elif isinstance(best, (list, tuple)):
-        price, size = float(best[0]), float(best[1])
-    else:
-        return float("inf"), 0.0
-
-    return price, size
 
 
 # ---------------------------------------------------------------------------
 # WebSocket client
 # ---------------------------------------------------------------------------
 
-class PolymarketWSClient:
+class KalshiWSClient:
     """
-    Connects to the Polymarket market WebSocket channel and pushes
-    price-change / book events into `event_queue`.
+    Connects to the Kalshi market WebSocket and pushes ticker update events
+    into `event_queue` for consumption by arb_bot.py.
 
-    Events placed in the queue are raw dicts from the server.
+    Subscribes to the `ticker` channel which delivers yes_ask / no_ask
+    updates in real-time as the order book changes.
     """
 
     def __init__(self, event_queue: queue.Queue):
         self._queue = event_queue
-        self._subscribed_token_ids: set[str] = set()
+        self._subscribed_tickers: set[str] = set()
         self._ws: Optional[websocket.WebSocketApp] = None
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self._lock = threading.Lock()
+        self._msg_id = 1
 
     # ── public API ──────────────────────────────────────────────────────────
 
-    def start(self, token_ids: list[str]) -> None:
-        """Connect and subscribe to token_ids."""
+    def start(self, tickers: list[str]) -> None:
         with self._lock:
-            self._subscribed_token_ids = set(token_ids)
+            self._subscribed_tickers = set(tickers)
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True, name="ws-client")
         self._thread.start()
-        logger.info("WebSocket client started (%d tokens)", len(token_ids))
+        logger.info("Kalshi WS client started (%d tickers)", len(tickers))
 
-    def update_subscriptions(self, token_ids: list[str]) -> None:
-        """Replace the tracked token set and re-subscribe."""
+    def update_subscriptions(self, tickers: list[str]) -> None:
         with self._lock:
-            self._subscribed_token_ids = set(token_ids)
+            self._subscribed_tickers = set(tickers)
         if self._ws:
             self._send_subscribe()
 
@@ -361,7 +310,7 @@ class PolymarketWSClient:
         while self._running:
             try:
                 self._ws = websocket.WebSocketApp(
-                    WS_URL,
+                    KALSHI_WS_URL,
                     on_open=self._on_open,
                     on_message=self._on_message,
                     on_error=self._on_error,
@@ -369,47 +318,49 @@ class PolymarketWSClient:
                 )
                 self._ws.run_forever(ping_interval=30, ping_timeout=10)
             except Exception as exc:
-                logger.error("WebSocket run error: %s", exc)
+                logger.error("Kalshi WS run error: %s", exc)
             if self._running:
-                logger.info("WebSocket reconnecting in 5 s …")
+                logger.info("Kalshi WS reconnecting in 5s…")
                 time.sleep(5)
 
     def _send_subscribe(self) -> None:
         if self._ws is None:
             return
         with self._lock:
-            ids = list(self._subscribed_token_ids)
-        # Cap to MAX_WS_TOKENS — oversized frames cause immediate disconnection.
-        # The stored set is already ordered by insertion (volume desc), so
-        # slicing keeps the highest-volume tokens.
-        if len(ids) > MAX_WS_TOKENS:
-            ids = ids[:MAX_WS_TOKENS]
-            logger.debug("WS subscription capped to %d tokens", MAX_WS_TOKENS)
-        if not ids:
+            tickers = list(self._subscribed_tickers)
+        if len(tickers) > MAX_WS_MARKETS:
+            tickers = tickers[:MAX_WS_MARKETS]
+            logger.debug("WS subscription capped to %d tickers", MAX_WS_MARKETS)
+        if not tickers:
             return
-        msg = json.dumps({"assets_ids": ids, "type": "market"})
+        msg = json.dumps({
+            "id":  self._msg_id,
+            "cmd": "subscribe",
+            "params": {
+                "channels":       ["ticker"],
+                "market_tickers": tickers,
+            },
+        })
+        self._msg_id += 1
         try:
             self._ws.send(msg)
-            logger.debug("WS subscribed to %d tokens", len(ids))
+            logger.debug("Kalshi WS subscribed to %d tickers", len(tickers))
         except Exception as exc:
-            logger.warning("WS send error: %s", exc)
+            logger.warning("Kalshi WS send error: %s", exc)
 
     def _on_open(self, ws) -> None:
-        logger.info("WebSocket connected to %s", WS_URL)
+        logger.info("Kalshi WS connected to %s", KALSHI_WS_URL)
         self._send_subscribe()
 
     def _on_message(self, ws, raw: str) -> None:
         try:
             data = json.loads(raw)
-            # Server may send a list or a single object
-            events = data if isinstance(data, list) else [data]
-            for event in events:
-                self._queue.put(event)
+            self._queue.put(data)
         except json.JSONDecodeError:
             logger.debug("Non-JSON WS message: %s", raw[:200])
 
     def _on_error(self, ws, error) -> None:
-        logger.warning("WebSocket error: %s", error)
+        logger.warning("Kalshi WS error: %s", error)
 
     def _on_close(self, ws, code, msg) -> None:
-        logger.info("WebSocket closed (code=%s): %s", code, msg)
+        logger.info("Kalshi WS closed (code=%s): %s", code, msg)

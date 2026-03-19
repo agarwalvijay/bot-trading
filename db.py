@@ -6,21 +6,21 @@ Schema
 opportunities
     id             INTEGER  PRIMARY KEY AUTOINCREMENT
     detected_at    TEXT     ISO-8601 timestamp (UTC)
-    condition_id   TEXT     Polymarket condition/market id
-    question       TEXT     Human-readable market question
-    token_ids      TEXT     JSON array of outcome token ids
+    ticker         TEXT     Kalshi market ticker (e.g. "FED-25MAR-T4.50")
+    event_ticker   TEXT     Parent event ticker (empty for standalone binary)
+    title          TEXT     Human-readable market title
     outcomes       TEXT     JSON array of outcome labels
-    ask_prices     TEXT     JSON array of best-ask prices (same order as tokens)
-    ask_sizes      TEXT     JSON array of available size at best ask
+    ask_prices     TEXT     JSON array of best-ask prices (same order as outcomes)
+    ask_sizes      TEXT     JSON array of available contracts at best ask
     sum_asks       REAL     Sum of best-ask prices across all outcomes
     gross_profit   REAL     1 – sum_asks
-    total_fees     REAL     fee_rate * sum_asks
+    total_fees     REAL     Sum of parabolic taker fees per leg
     net_profit     REAL     gross_profit – total_fees
-    fee_rate       REAL     Fee rate used for calculation
+    taker_fee_coeff REAL    Fee coefficient used (0.07 = standard taker)
     source         TEXT     "REST" | "WS"
     category       TEXT     "opportunity" | "near_miss"
-    has_zero_size  INTEGER  1 if any leg has size <= 0 (seed-price ghost)
-    end_date_iso   TEXT     Market end date (only for net_profit > HIGH_PROFIT_THRESHOLD)
+    has_zero_size  INTEGER  1 if any leg has size <= 0
+    close_time     TEXT     Market close datetime
 """
 
 import json
@@ -48,23 +48,23 @@ def init_db() -> None:
     with _conn() as con:
         con.execute("""
             CREATE TABLE IF NOT EXISTS opportunities (
-                id             INTEGER PRIMARY KEY AUTOINCREMENT,
-                detected_at    TEXT    NOT NULL,
-                condition_id   TEXT    NOT NULL,
-                question       TEXT    NOT NULL,
-                token_ids      TEXT    NOT NULL,
-                outcomes       TEXT    NOT NULL,
-                ask_prices     TEXT    NOT NULL,
-                ask_sizes      TEXT    NOT NULL,
-                sum_asks       REAL    NOT NULL,
-                gross_profit   REAL    NOT NULL,
-                total_fees     REAL    NOT NULL,
-                net_profit     REAL    NOT NULL,
-                fee_rate       REAL    NOT NULL,
-                source         TEXT    NOT NULL DEFAULT 'REST',
-                category       TEXT    NOT NULL DEFAULT 'opportunity',
-                has_zero_size  INTEGER NOT NULL DEFAULT 0,
-                end_date_iso   TEXT
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                detected_at     TEXT    NOT NULL,
+                ticker          TEXT    NOT NULL,
+                event_ticker    TEXT    NOT NULL DEFAULT '',
+                title           TEXT    NOT NULL,
+                outcomes        TEXT    NOT NULL,
+                ask_prices      TEXT    NOT NULL,
+                ask_sizes       TEXT    NOT NULL,
+                sum_asks        REAL    NOT NULL,
+                gross_profit    REAL    NOT NULL,
+                total_fees      REAL    NOT NULL,
+                net_profit      REAL    NOT NULL,
+                taker_fee_coeff REAL    NOT NULL,
+                source          TEXT    NOT NULL DEFAULT 'REST',
+                category        TEXT    NOT NULL DEFAULT 'opportunity',
+                has_zero_size   INTEGER NOT NULL DEFAULT 0,
+                close_time      TEXT
             )
         """)
         con.execute("""
@@ -72,18 +72,17 @@ def init_db() -> None:
             ON opportunities (detected_at DESC)
         """)
         con.execute("""
-            CREATE INDEX IF NOT EXISTS idx_opp_condition
-            ON opportunities (condition_id)
+            CREATE INDEX IF NOT EXISTS idx_opp_ticker
+            ON opportunities (ticker)
         """)
-        # Migration: add columns that may be absent in existing databases.
-        # Must run before any index that references these columns.
-        _add_column_if_missing(con, "opportunities", "category",      "TEXT NOT NULL DEFAULT 'opportunity'")
-        _add_column_if_missing(con, "opportunities", "has_zero_size", "INTEGER NOT NULL DEFAULT 0")
-        _add_column_if_missing(con, "opportunities", "end_date_iso",  "TEXT")
         con.execute("""
             CREATE INDEX IF NOT EXISTS idx_opp_category
             ON opportunities (category)
         """)
+        # Migration: add columns that may be absent in existing databases
+        _add_column_if_missing(con, "opportunities", "event_ticker",    "TEXT NOT NULL DEFAULT ''")
+        _add_column_if_missing(con, "opportunities", "close_time",      "TEXT")
+        _add_column_if_missing(con, "opportunities", "taker_fee_coeff", "REAL NOT NULL DEFAULT 0.07")
 
 
 def _add_column_if_missing(con: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -97,15 +96,15 @@ def save_opportunity(opp: dict[str, Any]) -> int:
     with _conn() as con:
         cur = con.execute("""
             INSERT INTO opportunities
-                (detected_at, condition_id, question, token_ids, outcomes,
+                (detected_at, ticker, event_ticker, title, outcomes,
                  ask_prices, ask_sizes, sum_asks, gross_profit, total_fees,
-                 net_profit, fee_rate, source, category, has_zero_size, end_date_iso)
+                 net_profit, taker_fee_coeff, source, category, has_zero_size, close_time)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             datetime.now(timezone.utc).isoformat(),
-            opp["condition_id"],
-            opp["question"],
-            json.dumps(opp["token_ids"]),
+            opp["ticker"],
+            opp.get("event_ticker", ""),
+            opp["title"],
             json.dumps(opp["outcomes"]),
             json.dumps(opp["ask_prices"]),
             json.dumps(opp["ask_sizes"]),
@@ -113,11 +112,11 @@ def save_opportunity(opp: dict[str, Any]) -> int:
             opp["gross_profit"],
             opp["total_fees"],
             opp["net_profit"],
-            opp["fee_rate"],
+            opp.get("taker_fee_coeff", 0.07),
             opp.get("source", "REST"),
             opp.get("category", "opportunity"),
             1 if opp.get("has_zero_size") else 0,
-            opp.get("end_date_iso"),
+            opp.get("close_time"),
         ))
         return cur.lastrowid
 
