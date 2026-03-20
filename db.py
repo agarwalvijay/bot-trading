@@ -153,12 +153,17 @@ def init_db() -> None:
                 notes            TEXT
             )
         """)
+        _add_column_if_missing(con, "trades",        "exit_prices",      "TEXT NOT NULL DEFAULT '[]'")
+        _add_column_if_missing(con, "trades",        "exit_pnl",         "REAL")
         _add_column_if_missing(con, "opportunities", "event_ticker",     "TEXT NOT NULL DEFAULT ''")
         _add_column_if_missing(con, "opportunities", "close_time",       "TEXT")
         _add_column_if_missing(con, "opportunities", "taker_fee_coeff",  "REAL NOT NULL DEFAULT 0.07")
         _add_column_if_missing(con, "opportunities", "outcome_tickers",  "TEXT NOT NULL DEFAULT '[]'")
         _add_column_if_missing(con, "opportunities", "authorized",       "INTEGER NOT NULL DEFAULT 0")
         _add_column_if_missing(con, "opportunities", "trade_id",         "INTEGER")
+        _add_column_if_missing(con, "opportunities", "volume_24h",       "REAL NOT NULL DEFAULT 0")
+        _add_column_if_missing(con, "opportunities", "event_slug",       "TEXT NOT NULL DEFAULT ''")
+        _add_column_if_missing(con, "markets_cache", "subtitle",         "TEXT NOT NULL DEFAULT ''")
 
 
 def _add_column_if_missing(con: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -175,8 +180,8 @@ def save_opportunity(opp: dict[str, Any]) -> int:
                 (detected_at, ticker, event_ticker, title, outcomes,
                  ask_prices, ask_sizes, sum_asks, gross_profit, total_fees,
                  net_profit, taker_fee_coeff, source, category, has_zero_size,
-                 close_time, outcome_tickers)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 close_time, outcome_tickers, volume_24h, event_slug)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             datetime.now(timezone.utc).isoformat(),
             opp["ticker"],
@@ -195,6 +200,8 @@ def save_opportunity(opp: dict[str, Any]) -> int:
             1 if opp.get("has_zero_size") else 0,
             opp.get("close_time"),
             json.dumps(opp.get("outcome_tickers", [])),
+            opp.get("volume_24h", 0.0),
+            opp.get("event_slug", ""),
         ))
         return cur.lastrowid
 
@@ -254,6 +261,7 @@ def save_markets_cache(markets: dict) -> None:
             m.get("ticker", ""),
             m.get("event_ticker", ""),
             m.get("title", ""),
+            m.get("subtitle", ""),
             m.get("close_time"),
             m.get("seed_yes_ask"),
             m.get("seed_no_ask"),
@@ -268,10 +276,10 @@ def save_markets_cache(markets: dict) -> None:
     with _conn() as con:
         con.executemany("""
             INSERT OR REPLACE INTO markets_cache
-                (ticker, event_ticker, title, close_time,
+                (ticker, event_ticker, title, subtitle, close_time,
                  seed_yes_ask, seed_no_ask, seed_yes_ask_size, seed_no_ask_size,
                  volume_24h, cached_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """, rows)
         # Prune rows that have been closed for more than 2 hours
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
@@ -281,21 +289,23 @@ def save_markets_cache(markets: dict) -> None:
         """, (cutoff,))
 
 
-def load_markets_from_cache() -> list[dict]:
+def load_markets_from_cache(min_volume_24h: float = 0.0) -> list[dict]:
     """
     Return cached markets that haven't closed yet.
     Markets with no close_time are always included.
+    min_volume_24h: skip markets below this 24h volume threshold (0 = no filter).
     """
     now_iso = datetime.now(timezone.utc).isoformat()
     with _conn() as con:
         rows = con.execute("""
-            SELECT ticker, event_ticker, title, close_time,
+            SELECT ticker, event_ticker, title, subtitle, close_time,
                    seed_yes_ask, seed_no_ask, seed_yes_ask_size, seed_no_ask_size,
                    volume_24h, cached_at
             FROM markets_cache
-            WHERE close_time IS NULL OR close_time > ?
+            WHERE (close_time IS NULL OR close_time > ?)
+              AND (? <= 0 OR volume_24h >= ?)
             ORDER BY volume_24h DESC
-        """, (now_iso,)).fetchall()
+        """, (now_iso, min_volume_24h, min_volume_24h)).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -309,14 +319,15 @@ def markets_cache_count() -> int:
 # ---------------------------------------------------------------------------
 
 def get_authorized_opportunities() -> list[dict]:
-    """Return opportunity rows authorized for trading that have no active trade."""
+    """Return opportunity rows authorized for trading that have no active (non-aborted) trade."""
     with _conn() as con:
         rows = con.execute("""
-            SELECT * FROM opportunities
-            WHERE authorized = 1
-              AND category   = 'opportunity'
-              AND (trade_id IS NULL OR trade_id = 0)
-            ORDER BY net_profit DESC
+            SELECT o.* FROM opportunities o
+            LEFT JOIN trades t ON o.trade_id = t.id
+            WHERE o.authorized = 1
+              AND o.category   = 'opportunity'
+              AND (o.trade_id IS NULL OR o.trade_id = 0 OR t.status = 'aborted')
+            ORDER BY o.net_profit DESC
         """).fetchall()
     return [dict(r) for r in rows]
 
@@ -376,3 +387,16 @@ def get_trade(trade_id: int) -> Optional[dict]:
     with _conn() as con:
         row = con.execute("SELECT * FROM trades WHERE id = ?", (trade_id,)).fetchone()
     return dict(row) if row else None
+
+
+def get_complete_trades() -> list[dict]:
+    """Return all trades with status='complete' that have not yet been settled."""
+    with _conn() as con:
+        rows = con.execute("""
+            SELECT t.*, o.close_time
+            FROM trades t
+            LEFT JOIN opportunities o ON t.opportunity_id = o.id
+            WHERE t.status = 'complete'
+            ORDER BY t.completed_at DESC
+        """).fetchall()
+    return [dict(r) for r in rows]

@@ -12,7 +12,8 @@ Two-phase commit with unwind logic:
                Wait for full fill confirmation.
                If timeout: cancel, abort entirely.
 
-  Phase 2    : Place remaining legs immediately after Phase 1 confirms.
+  Phase 2    : Place ALL remaining legs simultaneously after Phase 1 confirms.
+               Wait for fills in parallel (one thread per leg).
                If all fill: ARB COMPLETE — log profit.
                If any fail: trigger UNWIND sequence.
 
@@ -36,9 +37,12 @@ from config import (
     DEMO_MODE,
     FILL_TIMEOUT_SECS,
     MAX_CONTRACTS_PER_TRADE,
-    MAX_LEG_DRIFT,
     MAX_TRADE_COST,
     MIN_NET_PROFIT,
+    SETTLE_ENABLED,
+    SETTLE_MIN_PROFIT_RATIO,
+    SETTLE_POLL_INTERVAL,
+    SETTLE_SKIP_IF_EXPIRY_MINS,
     TAKER_FEE_COEFF,
     TRADE_POLL_INTERVAL,
     TRADING_ENABLED,
@@ -48,8 +52,10 @@ from config import (
 from db import (
     create_trade,
     get_authorized_opportunities,
+    get_complete_trades,
     get_trade,
     mark_likely_resolved,
+    set_authorized,
     update_trade,
 )
 from fetcher import cancel_order, fetch_market_prices, get_order, get_order_fills, place_order
@@ -115,7 +121,6 @@ def _preflight(opp: dict) -> tuple[Optional[dict], Optional[str]]:
     Returns (result_dict, None) on success, or (None, reason_str) on abort.
 
     Aborts if:
-      - Any leg price has drifted > MAX_LEG_DRIFT from detected price
       - Current sum of asks >= 1.0  (arb no longer exists)
       - Current net profit < MIN_NET_PROFIT
       - Any leg has insufficient size
@@ -155,12 +160,6 @@ def _preflight(opp: dict) -> tuple[Optional[dict], Optional[str]]:
         if curr_price is None:
             reason = f"no_ask_price: {ticker}"
             logger.warning("preflight: %s — abort", reason)
-            return None, reason
-
-        if logged_p is not None and abs(curr_price - logged_p) > MAX_LEG_DRIFT:
-            drift = abs(curr_price - logged_p)
-            reason = f"price_drift: {ticker} {logged_p:.4f}→{curr_price:.4f} drift={drift:.4f}"
-            logger.warning("preflight: %s (max={MAX_LEG_DRIFT}) — abort", reason)
             return None, reason
 
         legs.append({
@@ -250,11 +249,27 @@ def _unwind(trade_id: int, filled_legs: list[dict]) -> None:
                 unwound = True
                 continue
             else:
-                logger.warning("Limit-sell timeout for %s — escalating to market", ticker)
+                logger.warning("Limit-sell timeout for %s — attempting cancel before market sell", ticker)
+                cancel_ok = False
                 try:
                     cancel_order(sell_id)
-                except Exception:
-                    pass
+                    cancel_ok = True
+                except Exception as exc:
+                    if "404" in str(exc):
+                        # Order already processed (may have filled at the last moment)
+                        logger.info("cancel_order(%s) 404 during unwind — treating as filled", sell_id)
+                        cancel_ok = True  # safe to proceed; order is gone
+                    else:
+                        logger.error(
+                            "cancel_order(%s) FAILED during unwind: %s — "
+                            "skipping market sell to avoid double-sell; manual intervention needed",
+                            sell_id, exc,
+                        )
+                        update_trade(trade_id,
+                                     status="unwind_failed",
+                                     unwind_reason=f"cancel_failed_before_market_sell ticker={ticker}")
+                if not cancel_ok:
+                    continue  # skip market sell for this leg — order state unknown
         except Exception as exc:
             logger.error("Limit-sell order failed for %s: %s", ticker, exc)
 
@@ -324,10 +339,13 @@ def execute_trade(opp: dict) -> None:
         if abort_reason and abort_reason.startswith("likely_resolved:"):
             mark_likely_resolved(opp_id)
             logger.info("Auto-deauthorized likely-resolved opp_id=%d: %s", opp_id, abort_reason)
+        elif abort_reason and any(abort_reason.startswith(p) for p in ("sum_ge_1:", "net_profit_too_low:")):
+            # Arb temporarily closed — stay authorized to catch next reappearance, don't spam logs
+            logger.debug("Preflight (opp_id=%d): %s — waiting for arb to reopen", opp_id, abort_reason)
         else:
-            # Transient failure (drift, spread closed) — leave authorized, retry next tick
+            # Transient failure (prices momentarily unavailable) — leave authorized, retry next tick
             logger.info("Preflight failed (opp_id=%d): %s — will retry", opp_id, abort_reason)
-        return
+        return False  # preflight failed — caller may try next authorized opp
 
     legs      = verified["legs"]
     count     = verified["count"]
@@ -365,11 +383,11 @@ def execute_trade(opp: dict) -> None:
 
     filled1 = _wait_for_fill(oid1, FILL_TIMEOUT_SECS)
     if not filled1 or filled1.get("filled_count", 0) == 0:
-        logger.warning("Phase 1 not filled — aborting (opp_id=%d)", opp_id)
+        logger.warning("Phase 1 not filled (timeout) opp_id=%d — will retry next tick", opp_id)
         update_trade(trade_id, status="aborted",
                      notes="phase1_timeout",
                      completed_at=datetime.now(timezone.utc).isoformat())
-        return
+        return True  # trade was attempted
 
     actual_count = filled1.get("filled_count", count)
     fp1 = filled1.get("yes_price", round(leg1["price"] * 100)) / 100
@@ -384,30 +402,54 @@ def execute_trade(opp: dict) -> None:
                  fill_prices=json.dumps(fill_prices),
                  fill_counts=json.dumps(fill_counts))
 
-    # ── Phase 2+: remaining legs ─────────────────────────────────────────────
+    # ── Phase 2+: remaining legs (simultaneous placement, parallel fill wait) ─
     phase2_failed = []
+    phase2_legs   = legs[1:]
 
-    for i, leg in enumerate(legs[1:], start=1):
-        logger.info("Phase 2 leg %d: %s  count=%d  price=%.4f",
+    # Fire all phase 2 orders at once
+    p2_orders = []  # list of (leg, order_id) or (leg, None) on place failure
+    update_trade(trade_id, status="phase2_placed")
+    for i, leg in enumerate(phase2_legs, start=1):
+        logger.info("Phase 2 place leg %d: %s  count=%d  price=%.4f",
                     i, leg["ticker"], actual_count, leg["price"])
-        update_trade(trade_id, status="phase2_placed")
-
         try:
             order = place_order(leg["ticker"], "buy", "yes", actual_count,
                                 leg["price"], client_order_id=coids[i])
             oid = order.get("order_id", "")
             order_ids.append(oid)
-            update_trade(trade_id, order_ids=json.dumps(order_ids))
+            p2_orders.append((leg, oid))
         except Exception as exc:
             logger.error("Phase 2 place_order failed for %s: %s", leg["ticker"], exc)
+            p2_orders.append((leg, None))
             phase2_failed.append(leg)
+
+    update_trade(trade_id, order_ids=json.dumps(order_ids))
+
+    # Now wait for all fills in parallel (one thread per leg)
+    p2_results: dict[str, Optional[dict]] = {}
+
+    def _fill_worker(ticker: str, oid: str) -> None:
+        p2_results[ticker] = _wait_for_fill(oid, FILL_TIMEOUT_SECS)
+
+    threads = []
+    for leg, oid in p2_orders:
+        if oid is None:
             continue
+        t = threading.Thread(target=_fill_worker, args=(leg["ticker"], oid), daemon=True)
+        t.start()
+        threads.append(t)
 
-        filled = _wait_for_fill(oid, FILL_TIMEOUT_SECS)
+    for t in threads:
+        t.join()
 
+    # Collect results
+    for i, (leg, oid) in enumerate(p2_orders, start=1):
+        if oid is None:
+            continue
+        filled = p2_results.get(leg["ticker"])
         if filled and filled.get("filled_count", 0) > 0:
-            fc  = filled.get("filled_count", actual_count)
-            fp  = filled.get("yes_price", round(leg["price"] * 100)) / 100
+            fc = filled.get("filled_count", actual_count)
+            fp = filled.get("yes_price", round(leg["price"] * 100)) / 100
             fill_prices.append(fp)
             fill_counts.append(fc)
             filled_legs.append({"ticker": leg["ticker"], "order_id": oid,
@@ -469,7 +511,7 @@ def execute_trade(opp: dict) -> None:
                          completed_at=datetime.now(timezone.utc).isoformat(),
                          fill_prices=json.dumps(fill_prices),
                          fill_counts=json.dumps(fill_counts))
-            return
+            return True  # trade was attempted
 
     # ── ARB COMPLETE ─────────────────────────────────────────────────────────
     total_cost    = sum(fp * fc for fp, fc in zip(fill_prices, fill_counts))
@@ -494,16 +536,23 @@ def execute_trade(opp: dict) -> None:
         "gross=+$%.4f  fees=-$%.4f  net=+$%.4f ===",
         mode, trade_id, actual_count, gross_pnl, fee_pnl, net_pnl,
     )
+    return True  # trade was attempted
 
 
 # ---------------------------------------------------------------------------
 # Trading loop (runs as a daemon thread)
 # ---------------------------------------------------------------------------
 
-def trading_loop(stop_event: threading.Event) -> None:
+def trading_loop(stop_event: threading.Event,
+                 trade_trigger: Optional[threading.Event] = None,
+                 priority_ids=None) -> None:
     """
     Poll for authorized opportunities and execute trades one at a time.
     Runs as a background thread started from arb_bot.main().
+
+    trade_trigger: optional Event set by WS/REST handlers when a fresh arb is
+    detected. Wakes the loop immediately rather than waiting TRADE_POLL_INTERVAL.
+    priority_ids: optional deque of opp_ids to try first this tick.
     """
     if not TRADING_ENABLED:
         logger.info("Trading disabled (TRADING_ENABLED=false) — trading loop not running")
@@ -516,11 +565,23 @@ def trading_loop(stop_event: threading.Event) -> None:
         try:
             opps = get_authorized_opportunities()
             if opps:
+                # Drain priority deque — sort triggered opp(s) to front
+                if priority_ids:
+                    pri = set()
+                    while True:
+                        try:
+                            pri.add(priority_ids.popleft())
+                        except IndexError:
+                            break
+                    opps.sort(key=lambda o: 0 if o["id"] in pri else 1)
+
                 logger.info("Trading loop: %d authorized opportunity/ies", len(opps))
-                # One trade at a time — acquire lock and execute
+                # One trade at a time — acquire lock and try each opp in priority order
                 if _trade_lock.acquire(blocking=False):
                     try:
-                        execute_trade(opps[0])
+                        for opp in opps:
+                            if execute_trade(opp):  # True = trade attempted; stop iterating
+                                break
                     finally:
                         _trade_lock.release()
                 else:
@@ -528,6 +589,219 @@ def trading_loop(stop_event: threading.Event) -> None:
         except Exception as exc:
             logger.error("Trading loop error: %s", exc)
 
-        stop_event.wait(TRADE_POLL_INTERVAL)
+        # Wait for trigger (immediate wake on new arb) or fallback timeout
+        if trade_trigger is not None:
+            triggered = trade_trigger.wait(timeout=TRADE_POLL_INTERVAL)
+            trade_trigger.clear()
+            if triggered:
+                logger.debug("Trading loop woken by arb trigger")
+        else:
+            stop_event.wait(TRADE_POLL_INTERVAL)
 
     logger.info("Trading loop stopped")
+
+
+# ---------------------------------------------------------------------------
+# Settle loop (runs as a daemon thread)
+# ---------------------------------------------------------------------------
+
+def _try_settle(trade: dict) -> None:
+    """
+    Check whether a completed trade can be exited early at a profit.
+
+    Fetches current YES bids for all leg tickers. If selling all positions now
+    yields exit_profit >= SETTLE_MIN_PROFIT_RATIO × recorded net_pnl, place
+    simultaneous sell orders and update the trade to 'settled'.
+    """
+    trade_id   = trade["id"]
+    mode       = "DEMO" if DEMO_MODE else "LIVE"
+
+    try:
+        leg_tickers  = json.loads(trade.get("leg_tickers")  or "[]")
+        fill_prices_l = json.loads(trade.get("fill_prices") or "[]")
+        fill_counts_l = json.loads(trade.get("fill_counts") or "[]")
+    except Exception as exc:
+        logger.warning("settle trade %d: parse error %s", trade_id, exc)
+        return
+
+    if not leg_tickers or not fill_prices_l:
+        return
+
+    if len(fill_counts_l) != len(leg_tickers) or len(fill_prices_l) != len(leg_tickers):
+        logger.warning("settle trade %d: leg/fill count mismatch — skipping", trade_id)
+        return
+
+    if any(fc <= 0 for fc in fill_counts_l):
+        return
+
+    entry_cost = sum(fp * fc for fp, fc in zip(fill_prices_l, fill_counts_l))
+
+    # Skip if expiry is imminent — just let it resolve
+    close_time = trade.get("close_time", "") or ""
+    if close_time:
+        try:
+            ct = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+            if ct.tzinfo is None:
+                ct = ct.replace(tzinfo=timezone.utc)
+            mins_left = (ct - datetime.now(timezone.utc)).total_seconds() / 60
+            if mins_left < SETTLE_SKIP_IF_EXPIRY_MINS:
+                logger.debug("settle trade %d: expiry in %.0f min — skipping", trade_id, mins_left)
+                return
+        except (ValueError, AttributeError):
+            pass
+
+    # Fetch current bids
+    current = fetch_market_prices(leg_tickers)
+    if not current:
+        return
+
+    bids       = []
+    bid_sizes  = []
+    for ticker in leg_tickers:
+        entry  = current.get(ticker, {})
+        bid    = entry.get("yes_bid")
+        bsize  = entry.get("yes_bid_size", 0.0)
+        if bid is None:
+            logger.debug("settle trade %d: no bid for %s", trade_id, ticker)
+            return
+        bids.append(bid)
+        bid_sizes.append(bsize)
+
+    # Ensure bid liquidity covers each leg's actual position
+    for i, (bsize, fc) in enumerate(zip(bid_sizes, fill_counts_l)):
+        if bsize < fc:
+            logger.debug(
+                "settle trade %d: insufficient bid size for leg %d %s (need %d, available %.0f)",
+                trade_id, i, leg_tickers[i], fc, bsize,
+            )
+            return
+
+    exit_revenue = sum(b * fc for b, fc in zip(bids, fill_counts_l))
+    exit_fees    = sum(TAKER_FEE_COEFF * b * (1 - b) * fc for b, fc in zip(bids, fill_counts_l))
+    exit_profit  = exit_revenue - exit_fees - entry_cost
+
+    recorded_net = trade.get("net_pnl") or 0.0
+    threshold    = SETTLE_MIN_PROFIT_RATIO * recorded_net
+
+    logger.debug(
+        "settle trade %d: exit_profit=%.4f  threshold=%.4f (ratio=%.2f × net=%.4f)  bids=%s",
+        trade_id, exit_profit, threshold, SETTLE_MIN_PROFIT_RATIO, recorded_net,
+        [round(b, 4) for b in bids],
+    )
+
+    if exit_profit < threshold:
+        return
+
+    logger.info(
+        "=== SETTLE [%s] trade_id=%d  exit_profit=+$%.4f  (threshold=+$%.4f) ===",
+        mode, trade_id, exit_profit, threshold,
+    )
+
+    # Place simultaneous sell orders (use per-leg fill count, not a shared count)
+    sell_orders = []
+    for i, (ticker, bid) in enumerate(zip(leg_tickers, bids)):
+        fc = fill_counts_l[i]
+        coid = str(uuid.uuid4())
+        try:
+            order = place_order(ticker, "sell", "yes", fc,
+                                bid, order_type="limit", client_order_id=coid)
+            sell_orders.append((ticker, bid, fc, order.get("order_id", "")))
+            logger.info("Settle sell placed: %s  count=%d  bid=%.4f", ticker, fc, bid)
+        except Exception as exc:
+            logger.error("Settle sell failed for %s: %s — aborting settle", ticker, exc)
+            # Cancel already-placed sells to avoid partial exit
+            for _, _, placed_oid in sell_orders:
+                try:
+                    cancel_order(placed_oid)
+                except Exception:
+                    pass
+            return
+
+    # Wait for all sell fills in parallel
+    sell_results: dict[str, Optional[dict]] = {}
+
+    def _sell_fill_worker(ticker: str, oid: str) -> None:
+        sell_results[ticker] = _wait_for_fill(oid, FILL_TIMEOUT_SECS)
+
+    threads = []
+    for ticker, _, fc, oid in sell_orders:
+        t = threading.Thread(target=_sell_fill_worker, args=(ticker, oid), daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+
+    exit_prices_actual = []
+    all_filled = True
+    for ticker, bid, fc, oid in sell_orders:
+        filled = sell_results.get(ticker)
+        if filled and filled.get("filled_count", 0) > 0:
+            ep = filled.get("yes_price", round(bid * 100)) / 100
+            exit_prices_actual.append(ep)
+            logger.info("Settle fill confirmed: %s @ %.4f", ticker, ep)
+        else:
+            logger.warning("Settle sell NOT filled for %s — trade left open", ticker)
+            all_filled = False
+            exit_prices_actual.append(None)
+
+    if not all_filled:
+        # Cancel any unfilled sell orders and leave trade as 'complete' for retry
+        for ticker, _, fc, oid in sell_orders:
+            try:
+                cancel_order(oid)
+            except Exception:
+                pass
+        return
+
+    # Compute actual exit PnL using per-leg fill counts
+    actual_exit_revenue = sum(
+        ep * fc for ep, (_, _, fc, _) in zip(exit_prices_actual, sell_orders)
+        if ep is not None
+    )
+    actual_exit_fees = sum(
+        TAKER_FEE_COEFF * ep * (1 - ep) * fc
+        for ep, (_, _, fc, _) in zip(exit_prices_actual, sell_orders)
+        if ep is not None
+    )
+    actual_exit_pnl = actual_exit_revenue - actual_exit_fees - entry_cost
+
+    update_trade(trade_id,
+                 status="settled",
+                 completed_at=datetime.now(timezone.utc).isoformat(),
+                 exit_prices=json.dumps(exit_prices_actual),
+                 exit_pnl=actual_exit_pnl)
+
+    logger.info(
+        "=== SETTLED [%s] trade_id=%d  exit_pnl=+$%.4f  "
+        "(vs theoretical net=+$%.4f  saved %.0f%% of wait) ===",
+        mode, trade_id, actual_exit_pnl, recorded_net,
+        100 * actual_exit_pnl / recorded_net if recorded_net else 0,
+    )
+
+
+def settle_loop(stop_event: threading.Event) -> None:
+    """
+    Monitor completed trades and exit positions early when profitable.
+    Runs as a background thread started from arb_bot.main().
+    """
+    if not SETTLE_ENABLED:
+        logger.info("Settle loop disabled (SETTLE_ENABLED=false)")
+        return
+
+    mode = "DEMO" if DEMO_MODE else "LIVE"
+    logger.info("Settle loop started [%s]  poll=%ds  ratio=%.2f",
+                mode, SETTLE_POLL_INTERVAL, SETTLE_MIN_PROFIT_RATIO)
+
+    while not stop_event.is_set():
+        try:
+            trades = get_complete_trades()
+            if trades:
+                logger.debug("Settle loop: checking %d complete trade(s)", len(trades))
+            for trade in trades:
+                _try_settle(trade)
+        except Exception as exc:
+            logger.error("Settle loop error: %s", exc)
+
+        stop_event.wait(SETTLE_POLL_INTERVAL)
+
+    logger.info("Settle loop stopped")

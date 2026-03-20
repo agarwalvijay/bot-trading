@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 
 from flask import Flask, render_template_string, request, redirect, url_for, jsonify
 
-from config import DB_PATH, TAKER_FEE_COEFF, TRADING_ENABLED
+from config import DB_PATH, DEMO_MODE, MIN_VOLUME_24H, TAKER_FEE_COEFF, TRADING_ENABLED
 from fetcher import fetch_market_prices
 
 app = Flask(__name__)
@@ -115,6 +115,18 @@ TEMPLATE = """<!doctype html>
         <div class="fs-5 fw-bold">{{ stats.last_seen_ago }}</div>
       </div>
     </div>
+    <div class="col-auto">
+      <div class="card stat-card text-center px-3 py-2">
+        <div class="text-muted small">Markets tracked</div>
+        <div class="fs-5 fw-bold text-info">{{ stats.tracked_markets }}</div>
+      </div>
+    </div>
+    <div class="col-auto">
+      <div class="card stat-card text-center px-3 py-2">
+        <div class="text-muted small">Min 24h vol</div>
+        <div class="fs-5 fw-bold text-secondary">{{ stats.min_volume_24h }}</div>
+      </div>
+    </div>
   </div>
 
   <!-- Filter tabs -->
@@ -171,6 +183,7 @@ TEMPLATE = """<!doctype html>
             <th>Legs</th>
             <th style="width:80px">Sum asks</th>
             <th style="width:90px">Net profit</th>
+            <th style="width:70px">Vol 24h</th>
             <th style="width:60px">Src</th>
             <th style="width:52px"></th>
           </tr>
@@ -227,6 +240,9 @@ TEMPLATE = """<!doctype html>
             <td>{{ "%.4f" | format(r.sum_asks) }}</td>
             <td class="{{ 'profit-pos' if r.net_profit >= 0.005 else ('profit-near' if r.net_profit >= 0 else 'profit-neg') }}">
               {{ "%+.3f%%" | format(r.net_profit * 100) }}
+            </td>
+            <td class="text-muted text-nowrap">
+              {% if r.volume_24h %}{{ "%.0f" | format(r.volume_24h) }}{% else %}—{% endif %}
             </td>
             <td>
               <span class="badge {{ 'bg-info text-dark' if r.source == 'WS' else 'bg-secondary' }}">
@@ -631,6 +647,8 @@ TRADES_TEMPLATE = """<!doctype html>
             <td>
               {% if t.is_attempting %}
                 <span class="badge bg-success">attempting…</span>
+              {% elif t.status == 'settled' %}
+                <span class="badge bg-success">&#9654; settled early</span>
               {% elif t.status == 'complete' %}
                 <span class="badge bg-success">complete</span>
               {% elif t.status in ('phase1_placed', 'phase2_placed') %}
@@ -645,7 +663,12 @@ TRADES_TEMPLATE = """<!doctype html>
                 <span class="badge bg-secondary">{{ t.status }}</span>
               {% endif %}
             </td>
-            <td class="small-mono">{{ t.opp_title }}</td>
+            <td class="small-mono">
+              {% if t.kalshi_url %}
+                <a href="{{ t.kalshi_url }}" target="_blank" rel="noopener"
+                   class="text-decoration-none text-dark">{{ t.opp_title }}</a>
+              {% else %}{{ t.opp_title }}{% endif %}
+            </td>
             <td class="text-muted text-nowrap">{{ t.started_ago }}</td>
             <td class="text-muted text-nowrap">{{ t.completed_ago }}</td>
             <td class="small-mono">
@@ -661,7 +684,13 @@ TRADES_TEMPLATE = """<!doctype html>
               {% endfor %}
             </td>
             <td>
-              {% if t.net_pnl is not none %}
+              {% if t.status == 'settled' and t.exit_pnl is not none %}
+                <span class="text-success fw-bold"
+                      title="Theoretical at expiry: {{ '%+.4f' | format(t.net_pnl) if t.net_pnl is not none else '?' }}">
+                  {{ "%+.4f" | format(t.exit_pnl) }}
+                  <small class="text-muted fw-normal">early</small>
+                </span>
+              {% elif t.net_pnl is not none %}
                 <span class="{{ 'text-success fw-bold' if t.net_pnl >= 0 else 'text-danger fw-bold' }}">
                   {{ "%+.4f" | format(t.net_pnl) }}
                 </span>
@@ -758,6 +787,25 @@ def _closes_in(close_time: str) -> dict:
         return {"label": "", "css": ""}
 
 
+_KALSHI_HOST = "demo.kalshi.co" if DEMO_MODE else "kalshi.com"
+
+
+def _kalshi_url(event_ticker: str, ticker: str, event_slug: str = "") -> str:
+    """Build the canonical Kalshi market URL from stored fields."""
+    et = event_ticker or ticker
+    if et.upper() == ticker.upper():
+        et_lower = re.sub(r"-\d.*$", "", ticker).lower()
+    else:
+        et_lower = et.lower()
+    if "spread" in et_lower:
+        et_lower = re.sub(r"spread", "game", et_lower)
+        return f"https://{_KALSHI_HOST}/markets/{et_lower}"
+    elif event_slug:
+        return f"https://{_KALSHI_HOST}/markets/{et_lower}/{event_slug}/{ticker.lower()}"
+    else:
+        return f"https://{_KALSHI_HOST}/markets/{et_lower}"
+
+
 def _get_rows(category=None, limit: int = 200) -> list:
     try:
         con = sqlite3.connect(DB_PATH)
@@ -786,26 +834,12 @@ def _get_rows(category=None, limit: int = 200) -> list:
             ]
         except Exception:
             legs = []
-        event_ticker = r["event_ticker"] or r["ticker"]
         ticker       = r["ticker"]
-        try:
-            is_binary = json.loads(r["outcomes"] or "[]") == ["Yes", "No"]
-        except Exception:
-            is_binary = False
+        event_ticker = r["event_ticker"] or r["ticker"]
+        raw_slug     = r["event_slug"] if "event_slug" in r.keys() and r["event_slug"] else ""
+        t_lower      = ticker.lower()
 
-        if is_binary:
-            # Link to the specific market ticker (full, no stripping)
-            # e.g. KXNCAAWBGAME-26MAR19NAVYHARV → kxncaawbgame-26mar19navyharv
-            url_slug = ticker.lower()
-        elif "SPREAD" in event_ticker.upper():
-            # Spread markets: swap SPREAD→GAME to link to the underlying game page
-            # e.g. KXNHLSPREAD-26MAR19CHIMIN → kxnhlgame-26mar19chimin
-            url_slug = re.sub(r"SPREAD", "GAME", event_ticker, flags=re.IGNORECASE).lower()
-        else:
-            # Use full event ticker — Kalshi routes /markets/{event_ticker} to the event page
-            # e.g. KXFIFAGAME-26MAR26CZEIRL → kxfifagame-26mar26czeirl
-            url_slug = event_ticker.lower()
-        kalshi_url = f"https://kalshi.com/markets/{url_slug}"
+        kalshi_url = _kalshi_url(event_ticker, ticker, raw_slug)
         rows.append({
             "row_id":        r["id"],
             "time_ago":      _time_ago(r["detected_at"]),
@@ -820,6 +854,7 @@ def _get_rows(category=None, limit: int = 200) -> list:
             "closes_in":     _closes_in(r["close_time"]),
             "authorized":    bool(r["authorized"]) if "authorized" in r.keys() else False,
             "trade_id":      r["trade_id"] if "trade_id" in r.keys() else None,
+            "volume_24h":    r["volume_24h"] if "volume_24h" in r.keys() else 0,
         })
     return rows
 
@@ -837,14 +872,23 @@ def _get_stats() -> dict:
         likely_resolved  = con.execute("SELECT COUNT(*) FROM opportunities WHERE category='likely_resolved'").fetchone()[0]
         last          = con.execute("SELECT MAX(detected_at) FROM opportunities").fetchone()[0]
         con.close()
+        # tracked markets count from arb_bot (imported lazily to avoid circular import)
+        try:
+            import arb_bot
+            tracked = len(arb_bot.markets_by_ticker)
+        except Exception:
+            tracked = "—"
+        min_vol = int(MIN_VOLUME_24H) if MIN_VOLUME_24H > 0 else "off"
         return {"total": total, "opps": opps, "near_miss": near_miss,
                 "cumulative": cumulative, "non_exhaustive": non_exhaustive,
                 "spread_market": spread_market, "ignored": ignored,
-                "likely_resolved": likely_resolved, "last_seen_ago": _time_ago(last)}
+                "likely_resolved": likely_resolved, "last_seen_ago": _time_ago(last),
+                "tracked_markets": tracked, "min_volume_24h": min_vol}
     except Exception:
         return {"total": 0, "opps": 0, "near_miss": 0,
                 "cumulative": 0, "non_exhaustive": 0, "spread_market": 0,
-                "ignored": 0, "likely_resolved": 0, "last_seen_ago": "—"}
+                "ignored": 0, "likely_resolved": 0, "last_seen_ago": "—",
+                "tracked_markets": "—", "min_volume_24h": "—"}
 
 
 # ---------------------------------------------------------------------------
@@ -1035,7 +1079,7 @@ def _get_authorized_opps() -> list[dict]:
         con.row_factory = sqlite3.Row
         rows = con.execute("""
             SELECT o.id as opp_id, o.title, o.net_profit, o.close_time,
-                   o.ticker, o.event_ticker, o.trade_id,
+                   o.ticker, o.event_ticker, o.event_slug, o.trade_id,
                    t.status as trade_status
             FROM opportunities o
             LEFT JOIN trades t ON o.trade_id = t.id
@@ -1050,8 +1094,8 @@ def _get_authorized_opps() -> list[dict]:
     for r in rows:
         event_ticker = r["event_ticker"] or r["ticker"]
         ticker       = r["ticker"]
-        url_slug     = ticker.lower() if not event_ticker else event_ticker.lower()
-        kalshi_url   = f"https://kalshi.com/markets/{url_slug}"
+        event_slug   = r["event_slug"] if "event_slug" in r.keys() else ""
+        kalshi_url   = _kalshi_url(event_ticker, ticker, event_slug or "")
         result.append({
             "opp_id":       r["opp_id"],
             "title":        r["title"],
@@ -1070,14 +1114,15 @@ def _get_trades(limit: int = 100) -> tuple[list, dict]:
         con = sqlite3.connect(DB_PATH)
         con.row_factory = sqlite3.Row
         raw = con.execute("""
-            SELECT t.*, o.title as opp_title, o.id as opp_id
+            SELECT t.*, o.title as opp_title, o.id as opp_id,
+                   o.ticker as opp_ticker, o.event_ticker, o.event_slug
             FROM trades t
             LEFT JOIN opportunities o ON t.opportunity_id = o.id
             ORDER BY t.id DESC
             LIMIT ?
         """, (limit,)).fetchall()
         attempting_raw = con.execute("""
-            SELECT id, title, detected_at
+            SELECT id, title, detected_at, ticker, event_ticker, event_slug
             FROM opportunities
             WHERE authorized = 1 AND (trade_id IS NULL OR trade_id = 0)
         """).fetchall()
@@ -1099,6 +1144,7 @@ def _get_trades(limit: int = 100) -> tuple[list, dict]:
             "demo_mode":     False,
             "opp_id":        r["id"],
             "opp_title":     r["title"],
+            "kalshi_url":    _kalshi_url(r["event_ticker"] or r["ticker"], r["ticker"], r["event_slug"] or ""),
             "started_ago":   _time_ago(r["detected_at"]),
             "completed_ago": "—",
             "legs":          [],
@@ -1113,7 +1159,7 @@ def _get_trades(limit: int = 100) -> tuple[list, dict]:
     for r in raw:
         status = r["status"] or ""
         stats["total"] += 1
-        if status == "complete":
+        if status in ("complete", "settled"):
             stats["complete"] += 1
         elif status in in_progress_statuses:
             stats["in_progress"] += 1
@@ -1122,8 +1168,11 @@ def _get_trades(limit: int = 100) -> tuple[list, dict]:
         elif status == "aborted":
             stats["failed"] += 1
 
-        if r["net_pnl"] is not None:
-            stats["total_net_pnl"] += r["net_pnl"]
+        # For settled trades, use exit_pnl as the realized figure
+        exit_pnl     = r["exit_pnl"] if "exit_pnl" in r.keys() else None
+        realized_pnl = exit_pnl if status == "settled" else r["net_pnl"]
+        if realized_pnl is not None:
+            stats["total_net_pnl"] += realized_pnl
 
         try:
             leg_tickers   = json.loads(r["leg_tickers"]   or "[]")
@@ -1142,6 +1191,9 @@ def _get_trades(limit: int = 100) -> tuple[list, dict]:
                 "fill_count":   fill_counts_l[i]  if i < len(fill_counts_l)  else None,
             })
 
+        opp_ticker  = r["opp_ticker"] or ""
+        opp_evt_tkr = r["event_ticker"] or opp_ticker
+        opp_slug    = r["event_slug"] or ""
         trades.append({
             "id":            r["id"],
             "status":        status,
@@ -1149,10 +1201,12 @@ def _get_trades(limit: int = 100) -> tuple[list, dict]:
             "demo_mode":     bool(r["demo_mode"]),
             "opp_id":        r["opp_id"],
             "opp_title":     r["opp_title"] or f"opp #{r['opportunity_id']}",
+            "kalshi_url":    _kalshi_url(opp_evt_tkr, opp_ticker, opp_slug) if opp_ticker else "",
             "started_ago":   _time_ago(r["started_at"]),
             "completed_ago": _time_ago(r["completed_at"]) if r["completed_at"] else "—",
             "legs":          legs,
             "net_pnl":       r["net_pnl"],
+            "exit_pnl":      exit_pnl,
             "notes":         r["notes"],
             "unwind_reason": r["unwind_reason"],
         })
@@ -1164,8 +1218,11 @@ def _get_trades(limit: int = 100) -> tuple[list, dict]:
 def delete_trade(trade_id: int):
     try:
         con = sqlite3.connect(DB_PATH)
-        # Clear trade_id on the linked opportunity so it can be retried
-        con.execute("UPDATE opportunities SET trade_id = NULL WHERE trade_id = ?", (trade_id,))
+        # Deauthorize the linked opportunity and clear its trade_id
+        con.execute(
+            "UPDATE opportunities SET trade_id = NULL, authorized = 0 WHERE trade_id = ?",
+            (trade_id,),
+        )
         con.execute("DELETE FROM trades WHERE id = ?", (trade_id,))
         con.commit()
         con.close()

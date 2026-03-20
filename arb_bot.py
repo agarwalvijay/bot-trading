@@ -45,8 +45,10 @@ from config import (
     MIN_LEG_SIZE,
     MIN_MULTI_OUTCOME_SUM,
     MIN_NET_PROFIT,
+    MIN_VOLUME_24H,
     NEAR_MISS_LOWER,
     REST_POLL_INTERVAL,
+    SETTLE_ENABLED,
     TRADING_ENABLED,
     WS_ALERT_COOLDOWN_SECS,
     WS_FRESHNESS_SECS,
@@ -56,7 +58,13 @@ from db import (
     init_db, opportunity_count, save_opportunity, update_opportunity,
     load_markets_from_cache, save_markets_cache, markets_cache_count,
 )
-from trader import trading_loop
+from trader import settle_loop, trading_loop
+
+# Set by WS/REST handlers when a fresh arb opportunity is detected.
+# Wakes the trading loop immediately rather than waiting TRADE_POLL_INTERVAL.
+_trade_trigger = threading.Event()
+# opp_ids pushed here get sorted to the front of the next trading tick.
+_trade_priority_ids: collections.deque = collections.deque(maxlen=20)
 from fetcher import (
     KalshiWSClient,
     fetch_active_markets,
@@ -71,6 +79,11 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("arb_bot")
+
+def _slugify(text: str) -> str:
+    """Convert a string to a URL-friendly slug (lowercase, hyphens)."""
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
 
 # ---------------------------------------------------------------------------
 # Market state cache
@@ -130,6 +143,21 @@ _event_size_cache: dict[str, tuple[int, float]] = {}
 _EVENT_SIZE_CACHE_TTL = 3600.0  # re-verify once per hour
 
 
+def _prewarm_event_size_cache(markets: list) -> None:
+    """
+    Populate _event_size_cache from the full (unfiltered) market list returned
+    by fetch_active_markets().  Called once per full scan so that
+    _event_is_complete / _event_total_count never need to hit the API during
+    normal operation — they just read the pre-warmed cache instead.
+    """
+    from collections import Counter
+    counts = Counter(m.get("event_ticker") for m in markets if m.get("event_ticker"))
+    now_ts = time.time()
+    for evt, cnt in counts.items():
+        _event_size_cache[evt] = (cnt, now_ts)
+    logger.debug("Event size cache pre-warmed: %d events", len(counts))
+
+
 def _event_is_complete(event_ticker: str, tracked: int) -> bool:
     """
     Return True if `tracked` outcomes == all open outcomes for this event.
@@ -148,13 +176,25 @@ def _event_is_complete(event_ticker: str, tracked: int) -> bool:
             _event_size_cache[event_ticker] = (total, now)
 
     if total > 0 and total != tracked:
-        logger.warning(
+        logger.debug(
             "Incomplete event  %s: tracking %d of %d total outcomes — "
             "sum is partial, not real arb",
             event_ticker, tracked, total,
         )
         return False
     return True
+
+
+def _event_total_count(event_ticker: str) -> int:
+    """Return the API total market count for this event (cached 1 h). 0 = unknown."""
+    now = time.time()
+    cached = _event_size_cache.get(event_ticker)
+    if cached and (now - cached[1]) < _EVENT_SIZE_CACHE_TTL:
+        return cached[0]
+    total = fetch_event_market_count(event_ticker)
+    if total > 0:
+        _event_size_cache[event_ticker] = (total, now)
+    return total
 
 
 def _rebuild_event_groups() -> None:
@@ -331,6 +371,15 @@ def compute_opportunity(market: dict, source: str = "REST") -> Optional[dict]:
     if any(p <= MIN_LEG_PRICE for p in ask_prices):
         return None
 
+    # Guard: if this market is one of several buckets in a multi-outcome event
+    # (e.g. temperature ranges, score bands), the NO side bundles all other
+    # outcomes — YES+NO < 1.0 is structural, not a real binary arb.
+    event_ticker = market.get("event_ticker", "")
+    if event_ticker:
+        total = _event_total_count(event_ticker)
+        if total > 1:
+            return None
+
     sum_asks = sum(ask_prices)
     if sum_asks >= 1.0:
         return None
@@ -365,12 +414,14 @@ def compute_opportunity(market: dict, source: str = "REST") -> Optional[dict]:
         "category":       category,
         "has_zero_size":  has_zero_size,
         "close_time":     close_time,
+        "volume_24h":     market.get("volume_24h", 0.0),
+        "event_slug":     _slugify(market.get("subtitle", "") or market.get("event_ticker", "") or ticker),
     }
 
 
 # ── Cumulative/nested market detection patterns ───────────────────────────────
 # -DDMMM  e.g. -26APR, -26MAY, -01JAN (optionally followed by 2-digit year)
-_PAT_DDMMM   = re.compile(r"-\d{1,2}[A-Z]{3}(?:\d{2})?$")
+_PAT_DDMMM   = re.compile(r"-\d{1,2}[A-Z]{3}(?:\d{2})?(?:H\d{2,4})?$")
 # -MMMYY  e.g. -MAR26, -APR26
 _PAT_MMMYY   = re.compile(r"-[A-Z]{3}\d{2}$")
 # -QNYYYY e.g. -Q12026, -Q22026  (AMBIGUOUS: "by Q1" vs "in Q1")
@@ -386,6 +437,8 @@ def _cumulative_deadline_reason(markets: list) -> Optional[str]:
       1. OVER/ABOVE anywhere in 2+ tickers → threshold market ("price above $X")
       2. -DDMMM or -MMMYY date suffixes on 2+ tickers → deadline variants
          ("deal by April", "deal by May" …)
+      3. 2+ market titles contain "before" followed by a date/year → deadline
+         variants expressed in the title ("leave office before 2027-01-01 …")
 
     Quarterly (-QNYYYY) patterns are AMBIGUOUS and handled separately —
     they are NOT auto-skipped here.
@@ -405,6 +458,27 @@ def _cumulative_deadline_reason(markets: list) -> Optional[str]:
              if _PAT_DDMMM.search(t) or _PAT_MMMYY.search(t)]
     if len(dated) >= 2:
         return f"deadline-dated matched={dated}"
+
+    # Rule 3: titles containing "before <date>" — e.g. "leave office before 2027-01-01"
+    _before_date = re.compile(r"\bbefore\b.{1,6}20\d{2}", re.IGNORECASE)
+    titled = [m for m in markets if _before_date.search(m.get("title", ""))]
+    if len(titled) >= 2:
+        return f"deadline-title(before date) matched={[m['ticker'] for m in titled]}"
+
+    # Rule 4: titles containing "above/over <number>" — numeric threshold markets
+    # e.g. "Will above 100,000 jobs…" and "Will above 10,000 jobs…" are cumulative
+    # (satisfying the higher threshold implies satisfying all lower ones).
+    _above_number = re.compile(r"\b(above|over)\b[\s,]*\d", re.IGNORECASE)
+    above_titled = [m for m in markets if _above_number.search(m.get("title", ""))]
+    if len(above_titled) >= 2:
+        return f"threshold-title(above/over number) matched={[m['ticker'] for m in above_titled]}"
+
+    # Rule 5: time-snapshot markets (H0900, H1500, etc.) — e.g. NASDAQ hourly snapshots.
+    # Different time slots are independent, not mutually exclusive outcomes.
+    _PAT_HTIME = re.compile(r"H\d{3,4}$", re.IGNORECASE)
+    time_snaps = [t for t in tickers if _PAT_HTIME.search(t)]
+    if len(time_snaps) >= 2:
+        return f"time-snapshot(H####) matched={time_snaps}"
 
     return None
 
@@ -438,13 +512,17 @@ def _multi_outcome_result(
     """Build a result dict for a multi-outcome event (any category)."""
     event_ticker = markets[0].get("event_ticker") or markets[0]["ticker"]
     n = len(markets)
+    # Read cached total only — never trigger an API call here (called on every scan)
+    cached_entry = _event_size_cache.get(event_ticker)
+    total = cached_entry[0] if cached_entry else 0
+    way_label = f"[{total}-way]" if (total == n or total == 0) else f"[{n}/{total}-way]"
     gross_profit   = max(0.0, 1.0 - sum_asks)
     total_fees_val = _total_fees(ask_prices)
-    net_profit     = gross_profit - total_fees_val if category not in ("cumulative", "non_exhaustive") else 0.0
+    net_profit     = gross_profit - total_fees_val if category not in ("cumulative", "non_exhaustive", "spread_market") else 0.0
     return {
         "ticker":           event_ticker,
         "event_ticker":     event_ticker,
-        "title":            f"[{n}-way] {markets[0].get('title', event_ticker)}",
+        "title":            f"{way_label} {markets[0].get('title', event_ticker)}",
         "outcomes":         outcomes,
         "outcome_tickers":  [m["ticker"] for m in markets],
         "ask_prices":      ask_prices,
@@ -458,6 +536,8 @@ def _multi_outcome_result(
         "category":        category,
         "has_zero_size":   any(s <= 0 for s in ask_sizes),
         "close_time":      markets[0].get("close_time", "") if category == "opportunity" else None,
+        "volume_24h":      min(m.get("volume_24h", 0.0) for m in markets),
+        "event_slug":      _slugify(markets[0].get("subtitle", "") or markets[0].get("event_ticker", "") or markets[0]["ticker"]),
     }
 
 
@@ -538,25 +618,27 @@ def compute_multi_outcome_opportunity(markets: list, source: str = "REST") -> Op
     if sum_asks >= 1.0:
         return None  # no underround — nothing to log
 
-    # ── Guard 2: non-exhaustive set ──────────────────────────────────────────
+    n = len(markets)
+    event_ticker = markets[0].get("event_ticker") or markets[0]["ticker"]
+
+    # ── Guard 2: completeness check ──────────────────────────────────────────
+    # Check FIRST whether we're missing outcomes due to the volume filter.
+    # e.g. a 3-outcome soccer game (Win/Lose/Tie) where the Tie market has
+    # low volume and was filtered — the 2-outcome sum looks like an arb but isn't.
+    # Return None silently: this is a data-gap, not a structural non-exhaustive event.
+    if not _event_is_complete(event_ticker, n):
+        logger.debug("Skipping incomplete event=%s  tracked=%d  (missing outcomes)",
+                     event_ticker, n)
+        return None
+
+    # ── Guard 3: non-exhaustive set ──────────────────────────────────────────
+    # Only fires when we DO have all listed outcomes but the set doesn't cover
+    # all possible outcomes (open-ended rankings, correlated threshold markets).
     # Small N (≤4): correlated threshold markets ("Over 135pts", "Over 156pts")
     # Large N (≥5): open-ended rankings where an unlisted outcome can win
-    n = len(markets)
     if (n <= 4 and sum_asks < 0.70) or (n >= 5 and sum_asks < MIN_MULTI_OUTCOME_SUM):
-        event_key = markets[0].get("event_ticker") or markets[0]["ticker"]
         logger.debug("Logged [non_exhaustive]  event=%s  n=%d  sum=%.4f",
-                     event_key, n, sum_asks)
-        return _multi_outcome_result(markets, outcomes, ask_prices, ask_sizes,
-                                     sum_asks, "non_exhaustive", source)
-
-    # ── Guard 3: completeness check ──────────────────────────────────────────
-    # Verify we have ALL outcomes for this event before computing profit.
-    # Price-range markets (e.g. Nasdaq yearly range) may have buckets filtered
-    # by volume_24h > 0, making the partial sum appear < 1.0 when the full set
-    # is actually overround.  Result is cached 1h so only the first call per
-    # event hits the API.
-    event_ticker = markets[0].get("event_ticker") or markets[0]["ticker"]
-    if not _event_is_complete(event_ticker, len(markets)):
+                     event_ticker, n, sum_asks)
         return _multi_outcome_result(markets, outcomes, ask_prices, ask_sizes,
                                      sum_asks, "non_exhaustive", source)
 
@@ -662,6 +744,9 @@ def _rest_handle_result(result: dict) -> None:
     # WS priority: promote opportunity tickers for real-time tracking
     if result["category"] == "opportunity":
         _prioritize_opportunity_tickers([result["ticker"]])
+        if row_id:
+            _trade_priority_ids.append(row_id)
+        _trade_trigger.set()  # wake trading loop immediately
 
     with alert_cooldown_lock:
         rec = alert_cooldown.get(key)
@@ -837,6 +922,21 @@ def ws_event_loop(event_queue: queue.Queue, stop_event: threading.Event) -> None
 
         msg_type = event.get("type", "")
 
+        if msg_type == "ws_connected":
+            # WS (re)connected — ensure authorized opps are watched and trigger trader
+            from db import get_authorized_opportunities
+            auth_opps = get_authorized_opportunities()
+            if auth_opps:
+                tickers = [o["ticker"] for o in auth_opps if o.get("ticker")]
+                if tickers:
+                    _prioritize_opportunity_tickers(tickers)
+                if TRADING_ENABLED:
+                    for o in auth_opps:
+                        _trade_priority_ids.append(o["id"])
+                    _trade_trigger.set()
+                    logger.info("WS (re)connected: triggering trader for %d authorized opp(s)", len(auth_opps))
+            continue
+
         if msg_type == "ticker":
             msg = event.get("msg", {})
             ticker = msg.get("market_ticker", "")
@@ -937,6 +1037,9 @@ def _check_ticker_market(ticker: str, source: str) -> None:
             return
 
         row_id = save_opportunity(result)
+        if row_id:
+            _trade_priority_ids.append(row_id)
+        _trade_trigger.set()  # wake trading loop immediately
         mins = _minutes_to_close(result.get("close_time"))
         if mins is not None and mins < EXPIRING_SOON_MINS:
             if (5 <= mins < EXPIRING_SOON_MINS
@@ -974,6 +1077,8 @@ def _merge_new_markets(discovered: list[dict]) -> int:
     for m in discovered:
         t = m["ticker"]
         if t in markets_by_ticker:
+            continue
+        if MIN_VOLUME_24H > 0 and float(m.get("volume_24h", 0) or 0) < MIN_VOLUME_24H:
             continue
         markets_by_ticker[t] = m
         with prices_lock:
@@ -1020,7 +1125,11 @@ def market_refresh_loop(ws_client: Optional[KalshiWSClient], stop_event: threadi
             if do_full:
                 logger.info("Running full market rescan…")
                 markets = fetch_active_markets()
-                new_tickers: dict[str, dict] = {m["ticker"]: m for m in markets}
+                _prewarm_event_size_cache(markets)
+                new_tickers: dict[str, dict] = {
+                    m["ticker"]: m for m in markets
+                    if MIN_VOLUME_24H <= 0 or float(m.get("volume_24h", 0) or 0) >= MIN_VOLUME_24H
+                }
                 last_full_rescan    = now_ts
                 last_near_term_scan = now_ts  # full scan subsumes near-term
                 save_markets_cache(new_tickers)
@@ -1169,7 +1278,7 @@ def main() -> None:
     logger.info("Starting background initial market scan …")
     def _initial_load():
         # ── Phase 1: instant start from DB cache ────────────────────────────
-        cached = load_markets_from_cache()
+        cached = load_markets_from_cache(min_volume_24h=MIN_VOLUME_24H)
         if cached:
             for m in cached:
                 markets_by_ticker[m["ticker"]] = m
@@ -1197,6 +1306,7 @@ def main() -> None:
         # ── Phase 2: full API scan to refresh & update cache ────────────────
         try:
             markets = fetch_active_markets()
+            _prewarm_event_size_cache(markets)
             for m in markets:
                 markets_by_ticker[m["ticker"]] = m
                 with prices_lock:
@@ -1224,6 +1334,17 @@ def main() -> None:
                 remaining = [t for t in all_t if t not in priority_tickers]
                 _ws_client.update_subscriptions(pri + remaining)
                 logger.info("WS subscriptions updated: %d tickers", len(all_t))
+
+            # Fire trader for any opportunities already authorized in the DB
+            if TRADING_ENABLED:
+                from db import get_authorized_opportunities
+                auth_opps = get_authorized_opportunities()
+                if auth_opps:
+                    for o in auth_opps:
+                        _trade_priority_ids.append(o["id"])
+                    _trade_trigger.set()
+                    logger.info("Initial load: %d authorized opp(s) found in DB — trader triggered", len(auth_opps))
+
         except Exception as exc:
             logger.error("Initial API market scan failed: %s", exc)
 
@@ -1272,7 +1393,7 @@ def main() -> None:
     if TRADING_ENABLED:
         trade_thread = threading.Thread(
             target=trading_loop,
-            args=(stop_event,),
+            args=(stop_event, _trade_trigger, _trade_priority_ids),
             daemon=True,
             name="trading-loop",
         )
@@ -1280,6 +1401,16 @@ def main() -> None:
         threads.append(trade_thread)
     else:
         logger.info("Trading disabled (TRADING_ENABLED=false) — set true in .env to enable")
+
+    if SETTLE_ENABLED:
+        settle_thread = threading.Thread(
+            target=settle_loop,
+            args=(stop_event,),
+            daemon=True,
+            name="settle-loop",
+        )
+        settle_thread.start()
+        threads.append(settle_thread)
 
     logger.info(
         "Bot running. Press Ctrl+C to stop. "

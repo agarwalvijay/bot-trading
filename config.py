@@ -80,6 +80,11 @@ NEAR_MISS_LOWER = float(os.getenv("NEAR_MISS_LOWER", "-0.02"))
 # Rule of thumb: 0.85 means at most 15% probability in unlisted outcomes.
 MIN_MULTI_OUTCOME_SUM = float(os.getenv("MIN_MULTI_OUTCOME_SUM", "0.85"))
 
+# Minimum 24-hour volume (contracts) required to track a market.
+# Markets below this threshold are skipped entirely at scan time.
+# Set to 0 to disable the filter.
+MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H", "0"))
+
 # Net profit threshold above which close_time is logged for sanity checking
 HIGH_PROFIT_THRESHOLD = float(os.getenv("HIGH_PROFIT_THRESHOLD", "0.05"))
 
@@ -92,7 +97,13 @@ EXPIRING_SOON_MINS             = int(os.getenv("EXPIRING_SOON_MINS", "30"))
 EXPIRING_ACTIONABLE_MIN_PROFIT = float(os.getenv("EXPIRING_ACTIONABLE_MIN_PROFIT", "0.01"))
 
 # ── Database ──────────────────────────────────────────────────────────────────
-DB_PATH = os.getenv("DB_PATH", "arb_opportunities.db")
+# Demo mode gets its own DB so demo and prod markets/opportunities don't mix.
+# DEMO_MODE is defined below; evaluate DB_PATH after DEMO_MODE is set.
+_DEMO_MODE_EARLY = os.getenv("DEMO_MODE", "true").lower() == "true"
+DB_PATH = os.getenv(
+    "DB_PATH",
+    "arb_opportunities_demo.db" if _DEMO_MODE_EARLY else "arb_opportunities.db",
+)
 
 # ── Trading execution ─────────────────────────────────────────────────────────
 # Master switch — set true only when ready to place real/demo orders.
@@ -102,8 +113,9 @@ TRADING_ENABLED = os.getenv("TRADING_ENABLED", "false").lower() == "true"
 # Always start here. Switch to false only after demo validation.
 DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
 
-# Demo API base URL (only used for order placement when DEMO_MODE=true)
+# Demo API base URL — used for ALL API calls (scan + trade) when DEMO_MODE=true
 DEMO_BASE_URL = os.getenv("DEMO_BASE_URL", "https://demo-api.kalshi.co/trade-api/v2")
+DEMO_WS_URL   = os.getenv("DEMO_WS_URL",   "wss://demo-api.kalshi.co/trade-api/ws/v2")
 
 # Hard cap on contracts per leg per trade
 MAX_CONTRACTS_PER_TRADE = int(os.getenv("MAX_CONTRACTS_PER_TRADE", "50"))
@@ -131,6 +143,24 @@ ALLOW_DIRECTIONAL_HOLD = os.getenv("ALLOW_DIRECTIONAL_HOLD", "false").lower() ==
 
 # How often (seconds) the trading loop checks for newly authorized opportunities
 TRADE_POLL_INTERVAL = int(os.getenv("TRADE_POLL_INTERVAL", "5"))
+
+# ── Early settlement ───────────────────────────────────────────────────────────
+# When enabled, a separate thread monitors complete trades and exits positions
+# early if current bids allow capturing a profitable fraction of the arb now,
+# freeing capital for the next trade rather than waiting for market expiry.
+SETTLE_ENABLED = os.getenv("SETTLE_ENABLED", "false").lower() == "true"
+
+# How often (seconds) to check complete trades for early-exit opportunities
+SETTLE_POLL_INTERVAL = int(os.getenv("SETTLE_POLL_INTERVAL", "60"))
+
+# Exit early if current exit_profit >= this ratio × recorded net_pnl.
+# 0.0 = exit any time bids sum to a profit; 1.0 = only if exit beats expiry.
+# Recommended: 0.5 — capture half the arb profit now and redeploy capital.
+SETTLE_MIN_PROFIT_RATIO = float(os.getenv("SETTLE_MIN_PROFIT_RATIO", "0.5"))
+
+# Don't bother settling if close_time is less than this many minutes away —
+# just let it expire naturally (sell-side fees not worth it).
+SETTLE_SKIP_IF_EXPIRY_MINS = int(os.getenv("SETTLE_SKIP_IF_EXPIRY_MINS", "30"))
 
 # ── Alerting ──────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")

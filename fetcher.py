@@ -38,6 +38,7 @@ from config import (
     DEMO_BASE_URL,
     DEMO_MODE,
     DEMO_PRIVATE_KEY_PATH,
+    DEMO_WS_URL,
     KALSHI_BASE_URL,
     KALSHI_WS_URL,
     KALSHI_API_KEY_ID,
@@ -113,7 +114,7 @@ SESSION.headers.update({"Accept": "application/json"})
 
 def _get(path: str, params: Optional[dict] = None, auth: bool = False, retries: int = 3) -> Any:
     """GET with simple exponential-backoff retry."""
-    url = f"{KALSHI_BASE_URL}{path}"
+    url = f"{_trade_base()}{path}"
     headers = _auth_headers("GET", path) if auth else {}
     for attempt in range(retries):
         try:
@@ -281,6 +282,7 @@ def _parse_market_row(m: dict) -> Optional[dict]:
         "ticker":            ticker,
         "event_ticker":      m.get("event_ticker", ""),
         "title":             (m.get("title") or m.get("yes_sub_title") or ticker),
+        "subtitle":          m.get("subtitle") or m.get("event_sub_title") or "",
         "close_time":        m.get("close_time") or m.get("expiration_time") or "",
         "seed_yes_ask":      _parse_price(m.get("yes_ask_dollars") or m.get("yes_ask")),
         "seed_no_ask":       _parse_price(m.get("no_ask_dollars")  or m.get("no_ask")),
@@ -435,7 +437,12 @@ def fetch_event_market_count(event_ticker: str) -> int:
     Return the total number of open markets for an event, ignoring the
     volume filter used by the main scanner.  Used to verify that we have
     all outcomes before treating a multi-outcome group as arb-eligible.
+
+    This should rarely be called in normal operation because _prewarm_event_size_cache
+    pre-populates the cache on every full market scan.  The 0.5s sleep here is a
+    safety net for the uncommon case of brand-new events not yet in the cache.
     """
+    time.sleep(0.5)  # rate-limit fallback calls — cache should cover 99% of cases
     try:
         data = _get("/markets", params={
             "event_ticker": event_ticker,
@@ -477,6 +484,8 @@ def fetch_market_prices(tickers: list[str]) -> dict[str, dict]:
                     "yes_ask_size": float(m.get("yes_ask_size_fp") or m.get("yes_ask_size") or 0),
                     "no_ask":       _parse_price(m.get("no_ask_dollars")  or m.get("no_ask")),
                     "no_ask_size":  float(m.get("no_ask_size_fp")  or m.get("no_ask_size")  or 0),
+                    "yes_bid":      _parse_price(m.get("yes_bid_dollars") or m.get("yes_bid")),
+                    "yes_bid_size": float(m.get("yes_bid_size_fp") or m.get("yes_bid_size") or 0),
                 }
         except Exception as exc:
             logger.warning("fetch_market_prices batch error: %s", exc)
@@ -535,14 +544,15 @@ class KalshiWSClient:
             try:
                 # Auth headers must be on the HTTP upgrade request itself.
                 # Sign with path "/trade-api/ws/v2" (no host, no query string).
-                headers = _auth_headers("GET", "/trade-api/ws/v2")
+                headers = _auth_headers("GET", "/trade-api/ws/v2", demo=DEMO_MODE)
                 if not headers:
                     logger.warning(
                         "Kalshi WS: no API credentials configured — "
                         "set KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PATH in .env"
                     )
+                ws_url = DEMO_WS_URL if DEMO_MODE else KALSHI_WS_URL
                 self._ws = websocket.WebSocketApp(
-                    KALSHI_WS_URL,
+                    ws_url,
                     header=headers,
                     on_open=self._on_open,
                     on_message=self._on_message,
@@ -582,8 +592,10 @@ class KalshiWSClient:
             logger.warning("Kalshi WS send error: %s", exc)
 
     def _on_open(self, ws) -> None:
-        logger.info("Kalshi WS connected to %s", KALSHI_WS_URL)
+        logger.info("Kalshi WS connected to %s", DEMO_WS_URL if DEMO_MODE else KALSHI_WS_URL)
         self._send_subscribe()
+        # Signal arb_bot to re-check authorized opps (handles reconnect case)
+        self._queue.put({"type": "ws_connected"})
 
     def _on_message(self, ws, raw: str) -> None:
         try:
