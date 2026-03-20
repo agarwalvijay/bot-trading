@@ -39,6 +39,8 @@ from config import (
     HIGH_PROFIT_THRESHOLD,
     MARKET_REFRESH_INTERVAL,
     MAX_REST_MARKETS,
+    NEAR_TERM_HORIZON_HOURS,
+    NEAR_TERM_SCAN_INTERVAL,
     MIN_LEG_PRICE,
     MIN_LEG_SIZE,
     MIN_MULTI_OUTCOME_SUM,
@@ -58,6 +60,7 @@ from fetcher import (
     fetch_active_markets,
     fetch_event_market_count,
     fetch_market_prices,
+    fetch_near_term_markets,
 )
 
 logging.basicConfig(
@@ -963,70 +966,83 @@ def _check_ticker_market(ticker: str, source: str) -> None:
 # Market refresh loop
 # ---------------------------------------------------------------------------
 
+def _merge_new_markets(discovered: list[dict]) -> int:
+    """
+    Add newly discovered markets to markets_by_ticker and live_prices.
+    Skips tickers already tracked.  Returns count of genuinely new tickers.
+    """
+    added = 0
+    for m in discovered:
+        t = m["ticker"]
+        if t in markets_by_ticker:
+            continue
+        markets_by_ticker[t] = m
+        with prices_lock:
+            if t not in live_prices:
+                live_prices[t] = {
+                    "yes_ask":      m.get("seed_yes_ask"),
+                    "yes_ask_size": m.get("seed_yes_ask_size", 0.0),
+                    "no_ask":       m.get("seed_no_ask"),
+                    "no_ask_size":  m.get("seed_no_ask_size", 0.0),
+                }
+        added += 1
+    return added
+
+
 def market_refresh_loop(ws_client: Optional[KalshiWSClient], stop_event: threading.Event) -> None:
     """
-    Periodically refresh the market list.
+    Periodically refresh the market list using three tiers:
 
-    Because Kalshi has millions of markets and the full paginating scan takes
-    several minutes, we use two strategies:
+    Fast refresh (every MARKET_REFRESH_INTERVAL, default 5 min):
+      Re-fetch only known tickers via GET /markets?tickers=...
+      Updates prices and detects closed/settled markets.
 
-    Fast refresh (every MARKET_REFRESH_INTERVAL):
-      Re-fetch only the tickers we already know via GET /markets?tickers=...
-      This updates prices + detects closed markets quickly without re-paginating.
+    Near-term scan (every NEAR_TERM_SCAN_INTERVAL, default 15 min):
+      Fetch markets closing within NEAR_TERM_HORIZON_HOURS (default 12h).
+      Catches new sports events and near-term markets without a full scan.
 
     Full rescan (every 6 hours):
-      Re-run fetch_active_markets() to discover newly opened markets.
+      Re-run fetch_active_markets() to discover all newly opened markets.
     """
-    logger.info("Market refresh loop started (interval=%.0fs)", MARKET_REFRESH_INTERVAL)
-    FULL_RESCAN_INTERVAL = 6 * 3600  # full re-paginate every 6 hours
-    last_full_rescan = time.time()
+    logger.info(
+        "Market refresh loop started (fast=%.0fs  near-term=%.0fs  full=6h)",
+        MARKET_REFRESH_INTERVAL, NEAR_TERM_SCAN_INTERVAL,
+    )
+    FULL_RESCAN_INTERVAL = 6 * 3600
+    last_full_rescan   = time.time()
+    last_near_term_scan = time.time() - NEAR_TERM_SCAN_INTERVAL  # run near-term on first tick
 
     while not stop_event.is_set():
         try:
             now_ts = time.time()
-            do_full = (now_ts - last_full_rescan) >= FULL_RESCAN_INTERVAL
+            do_full      = (now_ts - last_full_rescan)    >= FULL_RESCAN_INTERVAL
+            do_near_term = (now_ts - last_near_term_scan) >= NEAR_TERM_SCAN_INTERVAL
 
             if do_full:
                 logger.info("Running full market rescan…")
                 markets = fetch_active_markets()
                 new_tickers: dict[str, dict] = {m["ticker"]: m for m in markets}
-                last_full_rescan = now_ts
+                last_full_rescan    = now_ts
+                last_near_term_scan = now_ts  # full scan subsumes near-term
                 save_markets_cache(new_tickers)
-            else:
-                # Fast path: re-fetch only known tickers to update prices + detect closures
-                known = list(markets_by_ticker.keys())
-                if not known:
-                    stop_event.wait(MARKET_REFRESH_INTERVAL)
-                    continue
-                refreshed = fetch_market_prices(known)
-                new_tickers = {}
-                for ticker, prices in refreshed.items():
-                    m = markets_by_ticker.get(ticker, {}).copy()
-                    m.update(prices)
-                    new_tickers[ticker] = m
-                # Drop any tickers that didn't come back (closed/settled)
-                for ticker in known:
-                    if ticker not in refreshed:
-                        new_tickers.pop(ticker, None)
 
-            # Atomic swap: add/update first, then remove evicted
-            markets_by_ticker.update(new_tickers)
-            for t in list(markets_by_ticker):
-                if t not in new_tickers:
-                    markets_by_ticker.pop(t, None)
-                    with alert_cooldown_lock:
-                        alert_cooldown.pop(t, None)
-                    with rest_state_lock:
-                        rest_state.pop(t, None)
-                    with ws_activity_lock:
-                        ws_activity.pop(t, None)
-                    with prices_lock:
-                        live_prices.pop(t, None)
-                    with priority_lock:
-                        priority_tickers.discard(t)
+                # Atomic swap: update existing + remove evicted (closed/settled)
+                markets_by_ticker.update(new_tickers)
+                for t in list(markets_by_ticker):
+                    if t not in new_tickers:
+                        markets_by_ticker.pop(t, None)
+                        with alert_cooldown_lock:
+                            alert_cooldown.pop(t, None)
+                        with rest_state_lock:
+                            rest_state.pop(t, None)
+                        with ws_activity_lock:
+                            ws_activity.pop(t, None)
+                        with prices_lock:
+                            live_prices.pop(t, None)
+                        with priority_lock:
+                            priority_tickers.discard(t)
 
-            # Seed live_prices for newly discovered markets (full rescan only)
-            if do_full:
+                # Seed live_prices for newly discovered markets
                 with prices_lock:
                     for m in new_tickers.values():
                         t = m["ticker"]
@@ -1037,6 +1053,60 @@ def market_refresh_loop(ws_client: Optional[KalshiWSClient], stop_event: threadi
                                 "no_ask":       m.get("seed_no_ask"),
                                 "no_ask_size":  m.get("seed_no_ask_size", 0.0),
                             }
+
+            elif do_near_term:
+                discovered = fetch_near_term_markets(NEAR_TERM_HORIZON_HOURS)
+                added = _merge_new_markets(discovered)
+                last_near_term_scan = now_ts
+                if added:
+                    logger.info("Near-term scan added %d new markets (total=%d)",
+                                added, len(markets_by_ticker))
+
+                # Fast-path price refresh for all known tickers runs below
+                known = list(markets_by_ticker.keys())
+                if known:
+                    refreshed = fetch_market_prices(known)
+                    for ticker, prices in refreshed.items():
+                        if ticker in markets_by_ticker:
+                            markets_by_ticker[ticker].update(prices)
+                    # Evict tickers that didn't come back
+                    for ticker in known:
+                        if ticker not in refreshed:
+                            markets_by_ticker.pop(ticker, None)
+                            with alert_cooldown_lock:
+                                alert_cooldown.pop(ticker, None)
+                            with rest_state_lock:
+                                rest_state.pop(ticker, None)
+                            with ws_activity_lock:
+                                ws_activity.pop(ticker, None)
+                            with prices_lock:
+                                live_prices.pop(ticker, None)
+                            with priority_lock:
+                                priority_tickers.discard(ticker)
+
+            else:
+                # Fast path: re-fetch only known tickers to update prices + detect closures
+                known = list(markets_by_ticker.keys())
+                if not known:
+                    stop_event.wait(MARKET_REFRESH_INTERVAL)
+                    continue
+                refreshed = fetch_market_prices(known)
+                for ticker, prices in refreshed.items():
+                    if ticker in markets_by_ticker:
+                        markets_by_ticker[ticker].update(prices)
+                for ticker in known:
+                    if ticker not in refreshed:
+                        markets_by_ticker.pop(ticker, None)
+                        with alert_cooldown_lock:
+                            alert_cooldown.pop(ticker, None)
+                        with rest_state_lock:
+                            rest_state.pop(ticker, None)
+                        with ws_activity_lock:
+                            ws_activity.pop(ticker, None)
+                        with prices_lock:
+                            live_prices.pop(ticker, None)
+                        with priority_lock:
+                            priority_tickers.discard(ticker)
 
             if ws_client:
                 all_t = list(markets_by_ticker.keys())

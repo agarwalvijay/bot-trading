@@ -44,6 +44,12 @@ WS_FRESHNESS_SECS = int(os.getenv("WS_FRESHNESS_SECS", "60"))
 # Maximum markets to REST-poll per scan cycle
 MAX_REST_MARKETS = int(os.getenv("MAX_REST_MARKETS", "2500"))
 
+# Near-term discovery scan: fetch markets closing within this many hours,
+# run every NEAR_TERM_SCAN_INTERVAL seconds.  Catches new sports events
+# without waiting for the full 6-hour rescan.
+NEAR_TERM_SCAN_INTERVAL  = int(os.getenv("NEAR_TERM_SCAN_INTERVAL",  "900"))   # 15 min
+NEAR_TERM_HORIZON_HOURS  = float(os.getenv("NEAR_TERM_HORIZON_HOURS", "12"))
+
 # ── Fee model (Kalshi parabolic taker fee) ────────────────────────────────────
 # Taker fee per contract = TAKER_FEE_COEFF × price × (1 − price)
 # At $0.50 this equals 1.75¢/contract; approaches 0 near $0.01 or $0.99.

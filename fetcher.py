@@ -133,6 +133,31 @@ def _parse_price(val) -> Optional[float]:
         return None
 
 
+def _parse_market_row(m: dict) -> Optional[dict]:
+    """
+    Parse a single market dict from the Kalshi /markets response.
+    Returns None if the market should be skipped (provisional, no volume).
+    """
+    ticker = m.get("ticker", "")
+    if not ticker:
+        return None
+    if m.get("is_provisional"):
+        return None
+    if float(m.get("volume_24h_fp") or 0) <= 0:
+        return None
+    return {
+        "ticker":            ticker,
+        "event_ticker":      m.get("event_ticker", ""),
+        "title":             (m.get("title") or m.get("yes_sub_title") or ticker),
+        "close_time":        m.get("close_time") or m.get("expiration_time") or "",
+        "seed_yes_ask":      _parse_price(m.get("yes_ask_dollars") or m.get("yes_ask")),
+        "seed_no_ask":       _parse_price(m.get("no_ask_dollars")  or m.get("no_ask")),
+        "seed_yes_ask_size": float(m.get("yes_ask_size_fp") or m.get("yes_ask_size") or 0),
+        "seed_no_ask_size":  float(m.get("no_ask_size_fp")  or m.get("no_ask_size")  or 0),
+        "volume_24h":        float(m.get("volume_24h_fp") or 0),
+    }
+
+
 def fetch_active_markets() -> list[dict]:
     """
     Return all open Kalshi markets via cursor pagination.
@@ -150,15 +175,14 @@ def fetch_active_markets() -> list[dict]:
     markets: list[dict] = []
     cursor: Optional[str] = None
     page = 0
-    last_found_page = 0  # track when we last found an active market
 
     now_ts = int(time.time())
     while True:
         params: dict = {
-            "status":      "open",
-            "limit":       MARKET_PAGE_SIZE,
-            "mve_filter":  "exclude",       # skip sports parlay combinatorial markets
-            "min_close_ts": now_ts,         # skip already-closed markets server-side
+            "status":       "open",
+            "limit":        MARKET_PAGE_SIZE,
+            "mve_filter":   "exclude",
+            "min_close_ts": now_ts,
         }
         if cursor:
             params["cursor"] = cursor
@@ -172,39 +196,12 @@ def fetch_active_markets() -> list[dict]:
             break
 
         for m in batch:
-            ticker = m.get("ticker", "")
-            if not ticker:
-                continue
-
-            # Skip provisional markets and markets with no 24h volume.
-            if m.get("is_provisional"):
-                continue
-            if float(m.get("volume_24h_fp") or 0) <= 0:
-                continue
-
-            yes_ask      = _parse_price(m.get("yes_ask_dollars") or m.get("yes_ask"))
-            no_ask       = _parse_price(m.get("no_ask_dollars")  or m.get("no_ask"))
-            yes_ask_size = float(m.get("yes_ask_size_fp") or m.get("yes_ask_size") or 0)
-            no_ask_size  = float(m.get("no_ask_size_fp")  or m.get("no_ask_size")  or 0)
-
-            last_found_page = page
-            markets.append({
-                "ticker":            ticker,
-                "event_ticker":      m.get("event_ticker", ""),
-                "title":             (m.get("title") or m.get("yes_sub_title") or ticker),
-                "close_time":        m.get("close_time") or m.get("expiration_time") or "",
-                "seed_yes_ask":      yes_ask,
-                "seed_no_ask":       no_ask,
-                "seed_yes_ask_size": yes_ask_size,
-                "seed_no_ask_size":  no_ask_size,
-                "volume_24h":        float(m.get("volume_24h_fp") or 0),
-            })
+            parsed = _parse_market_row(m)
+            if parsed:
+                markets.append(parsed)
 
         cursor = data.get("cursor")
         if not cursor:
-            break
-
-        if MAX_MARKETS and len(markets) >= MAX_MARKETS:
             break
 
         if MAX_MARKETS and len(markets) >= MAX_MARKETS:
@@ -249,6 +246,56 @@ def fetch_active_markets() -> list[dict]:
         len(live), page, n_expired, n_multi_events, n_multi_markets,
     )
     return live
+
+
+def fetch_near_term_markets(horizon_hours: float = 12) -> list[dict]:
+    """
+    Fetch open markets closing within the next `horizon_hours` hours.
+
+    Much cheaper than a full scan — typically a handful of pages covering
+    sports games and near-term economic events.  Used for frequent
+    mid-tier discovery between full rescans.
+    """
+    now_ts = int(time.time())
+    max_ts = now_ts + int(horizon_hours * 3600)
+    markets: list[dict] = []
+    cursor: Optional[str] = None
+    page = 0
+
+    while True:
+        params: dict = {
+            "status":       "open",
+            "limit":        MARKET_PAGE_SIZE,
+            "mve_filter":   "exclude",
+            "min_close_ts": now_ts,
+            "max_close_ts": max_ts,
+        }
+        if cursor:
+            params["cursor"] = cursor
+
+        data = _get("/markets", params=params)
+        batch = data.get("markets", [])
+        page += 1
+
+        if not batch:
+            break
+
+        for m in batch:
+            parsed = _parse_market_row(m)
+            if parsed:
+                markets.append(parsed)
+
+        cursor = data.get("cursor")
+        if not cursor:
+            break
+
+        time.sleep(0.1)
+
+    logger.info(
+        "Near-term scan (%.0fh horizon): %d markets across %d pages",
+        horizon_hours, len(markets), page,
+    )
+    return markets
 
 
 def fetch_event_market_count(event_ticker: str) -> int:
