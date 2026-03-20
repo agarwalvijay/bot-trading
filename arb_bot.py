@@ -507,6 +507,17 @@ def compute_multi_outcome_opportunity(markets: list, source: str = "REST") -> Op
                                          sum_asks, "cumulative", source)
         return None
 
+    # ── Guard 2: spread markets ───────────────────────────────────────────────
+    # SPREAD events (e.g. KXNHLSPREAD, KXNBAASPREAD) mix nested over/under
+    # thresholds with team outcomes.  They are neither exhaustive nor mutually
+    # exclusive: a 1-goal win resolves all four YES-asks to NO, and a blowout
+    # can resolve two of them to YES.  Log as spread_market and skip arb check.
+    event_key = markets[0].get("event_ticker") or markets[0]["ticker"]
+    if "SPREAD" in event_key.upper() and sum_asks < 1.0:
+        logger.debug("Logged [spread_market]  event=%s  sum=%.4f", event_key, sum_asks)
+        return _multi_outcome_result(markets, outcomes, ask_prices, ask_sizes,
+                                     sum_asks, "spread_market", source)
+
     # Warn on ambiguous quarterly patterns but still scan
     qtrly_reason = _quarterly_ambiguous_reason(markets)
     if qtrly_reason:

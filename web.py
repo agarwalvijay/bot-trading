@@ -91,6 +91,12 @@ TEMPLATE = """<!doctype html>
     </div>
     <div class="col-auto">
       <div class="card stat-card text-center px-3 py-2">
+        <div class="text-muted small">Spread</div>
+        <div class="fs-5 fw-bold" style="color:#0d6efd">{{ stats.spread_market }}</div>
+      </div>
+    </div>
+    <div class="col-auto">
+      <div class="card stat-card text-center px-3 py-2">
         <div class="text-muted small">Last logged</div>
         <div class="fs-5 fw-bold">{{ stats.last_seen_ago }}</div>
       </div>
@@ -117,6 +123,10 @@ TEMPLATE = """<!doctype html>
     <li class="nav-item">
       <a class="nav-link {{ 'active fw-semibold' if category == 'non_exhaustive' }}"
          href="/?cat=non_exhaustive">Non-exhaustive</a>
+    </li>
+    <li class="nav-item">
+      <a class="nav-link {{ 'active fw-semibold' if category == 'spread_market' }}"
+         href="/?cat=spread_market">Spread</a>
     </li>
   </ul>
 
@@ -153,6 +163,8 @@ TEMPLATE = """<!doctype html>
                 <br><span class="badge bg-danger">CUMULATIVE</span>
               {% elif r.category == 'non_exhaustive' %}
                 <br><span class="badge" style="background:#6f42c1">NON-EXHAUSTIVE</span>
+              {% elif r.category == 'spread_market' %}
+                <br><span class="badge bg-primary">SPREAD</span>
               {% endif %}
             </td>
             <td class="legs">
@@ -260,6 +272,10 @@ def _get_rows(category=None, limit: int = 200) -> list:
             # Link to the specific market ticker (full, no stripping)
             # e.g. KXNCAAWBGAME-26MAR19NAVYHARV → kxncaawbgame-26mar19navyharv
             url_slug = ticker.lower()
+        elif "SPREAD" in event_ticker.upper():
+            # Spread markets: swap SPREAD→GAME to link to the underlying game page
+            # e.g. KXNHLSPREAD-26MAR19CHIMIN → kxnhlgame-26mar19chimin
+            url_slug = re.sub(r"SPREAD", "GAME", event_ticker, flags=re.IGNORECASE).lower()
         else:
             # Link to the event/series — strip from first date segment
             # e.g. KXNASDAQ100Y-26DEC31H1600 → kxnasdaq100y
@@ -288,14 +304,15 @@ def _get_stats() -> dict:
         near_miss     = con.execute("SELECT COUNT(*) FROM opportunities WHERE category='near_miss'").fetchone()[0]
         cumulative    = con.execute("SELECT COUNT(*) FROM opportunities WHERE category='cumulative'").fetchone()[0]
         non_exhaustive = con.execute("SELECT COUNT(*) FROM opportunities WHERE category='non_exhaustive'").fetchone()[0]
+        spread_market  = con.execute("SELECT COUNT(*) FROM opportunities WHERE category='spread_market'").fetchone()[0]
         last          = con.execute("SELECT MAX(detected_at) FROM opportunities").fetchone()[0]
         con.close()
         return {"total": total, "opps": opps, "near_miss": near_miss,
                 "cumulative": cumulative, "non_exhaustive": non_exhaustive,
-                "last_seen_ago": _time_ago(last)}
+                "spread_market": spread_market, "last_seen_ago": _time_ago(last)}
     except Exception:
         return {"total": 0, "opps": 0, "near_miss": 0,
-                "cumulative": 0, "non_exhaustive": 0, "last_seen_ago": "—"}
+                "cumulative": 0, "non_exhaustive": 0, "spread_market": 0, "last_seen_ago": "—"}
 
 
 # ---------------------------------------------------------------------------
