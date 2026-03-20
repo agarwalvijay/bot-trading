@@ -222,6 +222,10 @@ TEMPLATE = """<!doctype html>
     <div class="modal-content">
       <div class="modal-header py-2">
         <h6 class="modal-title fw-bold mb-0" id="liveModalTitle">Live Pricing</h6>
+        <div class="d-flex align-items-center gap-2 ms-auto me-2">
+          <button class="btn btn-sm btn-link text-muted p-0" id="liveRefreshBtn"
+                  onclick="showLive(_currentLiveRowId)" title="Refresh prices">&#8635;</button>
+        </div>
         <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
       </div>
       <div class="modal-body p-3" id="liveModalBody">
@@ -244,7 +248,9 @@ TEMPLATE = """<!doctype html>
 })();
 </script>
 <script>
+var _currentLiveRowId = null;
 function showLive(rowId) {
+  _currentLiveRowId = rowId;
   const modal = new bootstrap.Modal(document.getElementById('liveModal'));
   document.getElementById('liveModalTitle').textContent = 'Live Pricing';
   document.getElementById('liveModalBody').innerHTML =
