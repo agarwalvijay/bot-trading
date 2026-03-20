@@ -62,6 +62,13 @@ MIN_LEG_PRICE = float(os.getenv("MIN_LEG_PRICE", "0.01"))
 # Near-miss band: underrounds where fees consume the profit
 NEAR_MISS_LOWER = float(os.getenv("NEAR_MISS_LOWER", "-0.02"))
 
+# For multi-outcome events with 5+ outcomes, require the sum of YES asks to
+# be at least this high before treating the group as exhaustive.
+# Below this threshold the "missing" probability lives in unlisted outcomes
+# (e.g. song charts, open-ended rankings) — not a real arb.
+# Rule of thumb: 0.85 means at most 15% probability in unlisted outcomes.
+MIN_MULTI_OUTCOME_SUM = float(os.getenv("MIN_MULTI_OUTCOME_SUM", "0.85"))
+
 # Net profit threshold above which close_time is logged for sanity checking
 HIGH_PROFIT_THRESHOLD = float(os.getenv("HIGH_PROFIT_THRESHOLD", "0.05"))
 

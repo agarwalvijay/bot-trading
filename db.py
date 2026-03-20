@@ -21,12 +21,24 @@ opportunities
     category       TEXT     "opportunity" | "near_miss"
     has_zero_size  INTEGER  1 if any leg has size <= 0
     close_time     TEXT     Market close datetime
+
+markets_cache
+    ticker         TEXT     PRIMARY KEY — Kalshi market ticker
+    event_ticker   TEXT
+    title          TEXT
+    close_time     TEXT
+    seed_yes_ask   REAL
+    seed_no_ask    REAL
+    seed_yes_ask_size REAL
+    seed_no_ask_size  REAL
+    volume_24h     REAL
+    cached_at      TEXT     ISO-8601 timestamp when this row was last written
 """
 
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from config import DB_PATH
@@ -46,6 +58,20 @@ def _conn():
 def init_db() -> None:
     """Create tables and apply any missing column migrations."""
     with _conn() as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS markets_cache (
+                ticker            TEXT PRIMARY KEY,
+                event_ticker      TEXT NOT NULL DEFAULT '',
+                title             TEXT NOT NULL DEFAULT '',
+                close_time        TEXT,
+                seed_yes_ask      REAL,
+                seed_no_ask       REAL,
+                seed_yes_ask_size REAL NOT NULL DEFAULT 0,
+                seed_no_ask_size  REAL NOT NULL DEFAULT 0,
+                volume_24h        REAL NOT NULL DEFAULT 0,
+                cached_at         TEXT NOT NULL
+            )
+        """)
         con.execute("""
             CREATE TABLE IF NOT EXISTS opportunities (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -162,3 +188,65 @@ def get_recent_opportunities(limit: int = 50) -> list[dict]:
 def opportunity_count() -> int:
     with _conn() as con:
         return con.execute("SELECT COUNT(*) FROM opportunities").fetchone()[0]
+
+
+# ---------------------------------------------------------------------------
+# Markets cache
+# ---------------------------------------------------------------------------
+
+def save_markets_cache(markets: dict) -> None:
+    """Bulk-upsert the current markets_by_ticker dict into markets_cache."""
+    now = datetime.now(timezone.utc).isoformat()
+    rows = [
+        (
+            m.get("ticker", ""),
+            m.get("event_ticker", ""),
+            m.get("title", ""),
+            m.get("close_time"),
+            m.get("seed_yes_ask"),
+            m.get("seed_no_ask"),
+            m.get("seed_yes_ask_size", 0.0),
+            m.get("seed_no_ask_size", 0.0),
+            m.get("volume_24h", 0.0),
+            now,
+        )
+        for m in markets.values()
+        if m.get("ticker")
+    ]
+    with _conn() as con:
+        con.executemany("""
+            INSERT OR REPLACE INTO markets_cache
+                (ticker, event_ticker, title, close_time,
+                 seed_yes_ask, seed_no_ask, seed_yes_ask_size, seed_no_ask_size,
+                 volume_24h, cached_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+        """, rows)
+        # Prune rows that have been closed for more than 2 hours
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        con.execute("""
+            DELETE FROM markets_cache
+            WHERE close_time IS NOT NULL AND close_time < ?
+        """, (cutoff,))
+
+
+def load_markets_from_cache() -> list[dict]:
+    """
+    Return cached markets that haven't closed yet.
+    Markets with no close_time are always included.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with _conn() as con:
+        rows = con.execute("""
+            SELECT ticker, event_ticker, title, close_time,
+                   seed_yes_ask, seed_no_ask, seed_yes_ask_size, seed_no_ask_size,
+                   volume_24h, cached_at
+            FROM markets_cache
+            WHERE close_time IS NULL OR close_time > ?
+            ORDER BY volume_24h DESC
+        """, (now_iso,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def markets_cache_count() -> int:
+    with _conn() as con:
+        return con.execute("SELECT COUNT(*) FROM markets_cache").fetchone()[0]

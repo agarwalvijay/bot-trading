@@ -23,6 +23,7 @@ import collections
 import logging
 import math
 import queue
+import re
 import signal
 import sys
 import threading
@@ -40,6 +41,7 @@ from config import (
     MAX_REST_MARKETS,
     MIN_LEG_PRICE,
     MIN_LEG_SIZE,
+    MIN_MULTI_OUTCOME_SUM,
     MIN_NET_PROFIT,
     NEAR_MISS_LOWER,
     REST_POLL_INTERVAL,
@@ -47,10 +49,14 @@ from config import (
     WS_FRESHNESS_SECS,
     WS_MIN_PROFIT_IMPROVEMENT,
 )
-from db import init_db, opportunity_count, save_opportunity, update_opportunity
+from db import (
+    init_db, opportunity_count, save_opportunity, update_opportunity,
+    load_markets_from_cache, save_markets_cache, markets_cache_count,
+)
 from fetcher import (
     KalshiWSClient,
     fetch_active_markets,
+    fetch_event_market_count,
     fetch_market_prices,
 )
 
@@ -102,6 +108,63 @@ _ws_client: Optional[KalshiWSClient] = None
 # front of the WS subscription so they survive the MAX_WS_MARKETS cap.
 priority_tickers: set[str] = set()
 priority_lock = threading.Lock()
+
+# Cached event groupings — rebuilt after every market list update.
+# Avoids O(n) re-grouping on every WS tick.
+# {event_key: [market, ...]}  same semantics as _group_by_event()
+_event_groups: dict[str, list] = {}
+_event_groups_lock = threading.Lock()
+
+# ticker -> event_key reverse index for fast WS lookup
+_ticker_to_event_key: dict[str, str] = {}
+
+
+# Cache of event_ticker -> (total_market_count, fetched_at_ts)
+# Avoids re-querying the API for every scan cycle.
+_event_size_cache: dict[str, tuple[int, float]] = {}
+_EVENT_SIZE_CACHE_TTL = 3600.0  # re-verify once per hour
+
+
+def _event_is_complete(event_ticker: str, tracked: int) -> bool:
+    """
+    Return True if `tracked` outcomes == all open outcomes for this event.
+
+    Fetches the real count from the API on first call per event (then caches
+    for 1 hour).  A mismatch means we're missing outcomes due to the
+    volume_24h filter — the apparent underround is spurious.
+    """
+    now = time.time()
+    cached = _event_size_cache.get(event_ticker)
+    if cached and (now - cached[1]) < _EVENT_SIZE_CACHE_TTL:
+        total = cached[0]
+    else:
+        total = fetch_event_market_count(event_ticker)
+        if total > 0:
+            _event_size_cache[event_ticker] = (total, now)
+
+    if total > 0 and total != tracked:
+        logger.warning(
+            "Incomplete event  %s: tracking %d of %d total outcomes — "
+            "sum is partial, not real arb",
+            event_ticker, tracked, total,
+        )
+        return False
+    return True
+
+
+def _rebuild_event_groups() -> None:
+    """Recompute and cache event groupings from the current markets_by_ticker."""
+    groups = _group_by_event(list(markets_by_ticker.values()))
+    reverse: dict[str, str] = {}
+    for key, ms in groups.items():
+        for m in ms:
+            reverse[m["ticker"]] = key
+    with _event_groups_lock:
+        _event_groups.clear()
+        _event_groups.update(groups)
+        _ticker_to_event_key.clear()
+        _ticker_to_event_key.update(reverse)
+    logger.debug("Event groups rebuilt: %d groups, %d tickers indexed", len(groups), len(reverse))
 
 
 # ---------------------------------------------------------------------------
@@ -195,17 +258,34 @@ def _log_market_composition() -> None:
     multi = {k: ms for k, ms in groups.items() if len(ms) > 1}
     n_multi_events  = len(multi)
     n_multi_markets = sum(len(ms) for ms in multi.values())
+
+    n_cumulative = 0
+    n_quarterly  = 0
+    for ms in multi.values():
+        if _is_cumulative_deadline_group(ms):
+            n_cumulative += 1
+        elif _quarterly_ambiguous_reason(ms):
+            n_quarterly += 1
+    n_valid_multi = n_multi_events - n_cumulative - n_quarterly
+
     logger.info(
-        "Market composition: %d true binary markets  |  "
-        "%d multi-outcome events (%d total outcome markets)",
+        "Market composition: %d true binary  |  %d multi-outcome events (%d markets)"
+        "  |  cumulative deadline skipped: %d  |  quarterly ambiguous: %d"
+        "  |  valid multi-outcome (scannable): %d",
         n_binary, n_multi_events, n_multi_markets,
+        n_cumulative, n_quarterly, n_valid_multi,
     )
     if multi:
         samples = sorted(multi.items(), key=lambda kv: len(kv[1]), reverse=True)[:5]
         for eid, ms in samples:
+            tag = ""
+            if _is_cumulative_deadline_group(ms):
+                tag = " [CUMULATIVE-SKIP]"
+            elif _quarterly_ambiguous_reason(ms):
+                tag = " [QUARTERLY-AMBIGUOUS]"
             logger.info(
-                "  Multi-outcome event  eid=%s  n=%d  first_title=%s",
-                eid, len(ms), ms[0].get("title", "?")[:70],
+                "  Multi-outcome  eid=%s  n=%d%s  first_title=%s",
+                eid, len(ms), tag, ms[0].get("title", "?")[:70],
             )
 
 
@@ -283,52 +363,168 @@ def compute_opportunity(market: dict, source: str = "REST") -> Optional[dict]:
     }
 
 
+# ── Cumulative/nested market detection patterns ───────────────────────────────
+# -DDMMM  e.g. -26APR, -26MAY, -01JAN (optionally followed by 2-digit year)
+_PAT_DDMMM   = re.compile(r"-\d{1,2}[A-Z]{3}(?:\d{2})?$")
+# -MMMYY  e.g. -MAR26, -APR26
+_PAT_MMMYY   = re.compile(r"-[A-Z]{3}\d{2}$")
+# -QNYYYY e.g. -Q12026, -Q22026  (AMBIGUOUS: "by Q1" vs "in Q1")
+_PAT_QTRLY   = re.compile(r"-Q[1-4]\d{4}$")
+
+
+def _cumulative_deadline_reason(markets: list) -> Optional[str]:
+    """
+    Return a descriptive reason string if this group is cumulative/nested
+    (NOT mutually exclusive), or None if it looks like a valid exhaustive set.
+
+    Detection rules (any one fires → cumulative):
+      1. OVER/ABOVE anywhere in 2+ tickers → threshold market ("price above $X")
+      2. -DDMMM or -MMMYY date suffixes on 2+ tickers → deadline variants
+         ("deal by April", "deal by May" …)
+
+    Quarterly (-QNYYYY) patterns are AMBIGUOUS and handled separately —
+    they are NOT auto-skipped here.
+
+    The check is COUNT >= 2, not ALL.  A group like the Iranian nuclear deal
+    (4 deadline tickers + 1 year-only base ticker) still fires correctly.
+    """
+    tickers = [m["ticker"] for m in markets]
+
+    # Rule 1: OVER / ABOVE threshold markets
+    threshold = [t for t in tickers if "OVER" in t or "ABOVE" in t]
+    if len(threshold) >= 2:
+        return f"threshold(OVER/ABOVE) matched={threshold}"
+
+    # Rule 2: date-deadline suffixes (-DDMMM or -MMMYY)
+    dated = [t for t in tickers
+             if _PAT_DDMMM.search(t) or _PAT_MMMYY.search(t)]
+    if len(dated) >= 2:
+        return f"deadline-dated matched={dated}"
+
+    return None
+
+
+def _quarterly_ambiguous_reason(markets: list) -> Optional[str]:
+    """
+    Return a warning string if this group has ambiguous quarterly suffixes
+    (-Q12026, -Q22026 …).  Quarterly markets could be either cumulative
+    ('by Q1') or exhaustive ('in Q1') so we log but do NOT auto-skip.
+    """
+    tickers = [m["ticker"] for m in markets]
+    quarterly = [t for t in tickers if _PAT_QTRLY.search(t)]
+    if len(quarterly) >= 2:
+        return f"quarterly(ambiguous, not skipped) matched={quarterly}"
+    return None
+
+
+def _is_cumulative_deadline_group(markets: list) -> bool:
+    return _cumulative_deadline_reason(markets) is not None
+
+
+def _multi_outcome_result(
+    markets: list,
+    outcomes: list,
+    ask_prices: list,
+    ask_sizes: list,
+    sum_asks: float,
+    category: str,
+    source: str,
+) -> dict:
+    """Build a result dict for a multi-outcome event (any category)."""
+    event_ticker = markets[0].get("event_ticker") or markets[0]["ticker"]
+    n = len(markets)
+    gross_profit   = max(0.0, 1.0 - sum_asks)
+    total_fees_val = _total_fees(ask_prices)
+    net_profit     = gross_profit - total_fees_val if category not in ("cumulative", "non_exhaustive") else 0.0
+    return {
+        "ticker":          event_ticker,
+        "event_ticker":    event_ticker,
+        "title":           f"[{n}-way] {event_ticker}",
+        "outcomes":        outcomes,
+        "ask_prices":      ask_prices,
+        "ask_sizes":       ask_sizes,
+        "sum_asks":        sum_asks,
+        "gross_profit":    gross_profit,
+        "total_fees":      total_fees_val,
+        "net_profit":      net_profit,
+        "taker_fee_coeff": TAKER_FEE_COEFF,
+        "source":          source,
+        "category":        category,
+        "has_zero_size":   any(s <= 0 for s in ask_sizes),
+        "close_time":      markets[0].get("close_time", "") if category == "opportunity" else None,
+    }
+
+
 def compute_multi_outcome_opportunity(markets: list, source: str = "REST") -> Optional[dict]:
     """
     Evaluate a multi-outcome categorical event for arb.
 
-    Correct check: sum of YES asks across ALL sibling outcome markets < 1.0.
-    Buying YES on every outcome guarantees exactly one $1 payout.
+    Returns a result dict for ALL detected cases (opportunity, near_miss,
+    cumulative, non_exhaustive) so callers can log them with the right badge.
+    Returns None only when there is no price data or the market has resolved.
     """
     for market in markets:
         mins = _minutes_to_close(market.get("close_time"))
         if mins is not None and mins < -10:
-            return None
+            return None  # resolved — nothing to log
 
+    # Collect prices first so every logged result has real data
     ask_prices: list[float] = []
     ask_sizes:  list[float] = []
     outcomes:   list[str]   = []
-    tickers:    list[str]   = []
 
     with prices_lock:
         for market in markets:
             t = market["ticker"]
             entry = live_prices.get(t)
             if entry is None:
-                return None
+                return None  # no price data yet — skip silently
             yes_ask = entry.get("yes_ask")
             if yes_ask is None:
                 return None
             ask_prices.append(yes_ask)
             ask_sizes.append(entry.get("yes_ask_size", 0.0))
             outcomes.append(market.get("title", t)[:60])
-            tickers.append(t)
 
     if any(p < MIN_LEG_PRICE for p in ask_prices):
         return None
 
     sum_asks = sum(ask_prices)
+
+    # ── Guard 1: cumulative / nested deadline ────────────────────────────────
+    # Multiple outcomes can resolve YES (e.g. "deal by Apr" + "deal by May").
+    # Only log when sum < 1.0 — otherwise there's no apparent opportunity.
+    cumulative_reason = _cumulative_deadline_reason(markets)
+    if cumulative_reason:
+        if sum_asks < 1.0:
+            event_key = markets[0].get("event_ticker") or markets[0]["ticker"]
+            logger.debug("Logged [cumulative]  event=%s  sum=%.4f  %s",
+                         event_key, sum_asks, cumulative_reason)
+            return _multi_outcome_result(markets, outcomes, ask_prices, ask_sizes,
+                                         sum_asks, "cumulative", source)
+        return None
+
+    # Warn on ambiguous quarterly patterns but still scan
+    qtrly_reason = _quarterly_ambiguous_reason(markets)
+    if qtrly_reason:
+        logger.debug("Quarterly-ambiguous  event=%s  %s",
+                     markets[0].get("event_ticker") or markets[0]["ticker"], qtrly_reason)
+
     if sum_asks >= 1.0:
-        return None
+        return None  # no underround — nothing to log
 
-    # Sanity check: for truly mutually exclusive outcomes the sum of YES asks
-    # must be reasonably close to 1.0.  Correlated threshold markets (e.g.
-    # "Over 135pts", "Over 156pts", "Over 162pts") share an event_ticker but
-    # are NOT exhaustive — their YES prices can sum to 0.35 or less.
-    # We require sum > 0.7 to avoid these false positives.
-    if sum_asks < 0.70:
-        return None
+    # ── Guard 2: non-exhaustive set ──────────────────────────────────────────
+    # Small N (≤4): correlated threshold markets ("Over 135pts", "Over 156pts")
+    # Large N (≥5): open-ended rankings where an unlisted outcome can win
+    n = len(markets)
+    if (n <= 4 and sum_asks < 0.70) or (n >= 5 and sum_asks < MIN_MULTI_OUTCOME_SUM):
+        event_key = markets[0].get("event_ticker") or markets[0]["ticker"]
+        logger.debug("Logged [non_exhaustive]  event=%s  n=%d  sum=%.4f",
+                     event_key, n, sum_asks)
+        return _multi_outcome_result(markets, outcomes, ask_prices, ask_sizes,
+                                     sum_asks, "non_exhaustive", source)
 
+    # ── Real arb / near-miss check ───────────────────────────────────────────
     gross_profit   = 1.0 - sum_asks
     total_fees_val = _total_fees(ask_prices)
     net_profit     = gross_profit - total_fees_val
@@ -341,32 +537,23 @@ def compute_multi_outcome_opportunity(markets: list, source: str = "REST") -> Op
     else:
         return None
 
+    # ── Completeness check ───────────────────────────────────────────────────
+    # Verify we have ALL outcomes for this event.  Price-range markets (e.g.
+    # Nasdaq yearly range) may have buckets filtered by volume_24h > 0, making
+    # the partial sum appear < 1.0 when the full set is actually overround.
     event_ticker = markets[0].get("event_ticker") or markets[0]["ticker"]
-    title = f"[{len(markets)}-way] {markets[0]['title'][:60]}"
-    close_time = markets[0].get("close_time", "") if category == "opportunity" else None
+    if not _event_is_complete(event_ticker, len(markets)):
+        return _multi_outcome_result(markets, outcomes, ask_prices, ask_sizes,
+                                     sum_asks, "non_exhaustive", source)
 
-    return {
-        "ticker":          event_ticker,
-        "event_ticker":    event_ticker,
-        "title":           title,
-        "outcomes":        outcomes,
-        "ask_prices":      ask_prices,
-        "ask_sizes":       ask_sizes,
-        "sum_asks":        sum_asks,
-        "gross_profit":    gross_profit,
-        "total_fees":      total_fees_val,
-        "net_profit":      net_profit,
-        "taker_fee_coeff": TAKER_FEE_COEFF,
-        "source":          source,
-        "category":        category,
-        "has_zero_size":   has_zero_size,
-        "close_time":      close_time,
-    }
+    return _multi_outcome_result(markets, outcomes, ask_prices, ask_sizes,
+                                 sum_asks, category, source)
 
 
 def scan_all_markets(source: str = "REST") -> list[dict]:
     """Check every tracked market/event for arb and return all results."""
-    groups = _group_by_event(list(markets_by_ticker.values()))
+    with _event_groups_lock:
+        groups = dict(_event_groups)
     opps = []
     for event_markets in groups.values():
         if len(event_markets) == 1:
@@ -449,6 +636,14 @@ def _rest_handle_result(result: dict) -> None:
 
     if state is not None and abs(result["sum_asks"] - state["sum_asks"]) < 0.0001:
         return  # price unchanged
+
+    # Filtered categories: log once on first detection, no alert, no updates
+    if result["category"] in ("cumulative", "non_exhaustive"):
+        if state is None:
+            row_id = save_opportunity(result)
+            with rest_state_lock:
+                rest_state[key] = {"row_id": row_id, "sum_asks": result["sum_asks"]}
+        return
 
     if state is None:
         row_id = save_opportunity(result)
@@ -704,66 +899,62 @@ def _check_ticker_market(ticker: str, source: str) -> None:
     Find the event group containing this ticker and scan it for arb.
     Records WS activity for REST-skip logic.
     """
-    all_markets = list(markets_by_ticker.values())
-    groups = _group_by_event(all_markets)
+    # Use cached grouping for O(1) ticker lookup instead of O(n) re-grouping
+    with _event_groups_lock:
+        event_key = _ticker_to_event_key.get(ticker)
+        if event_key is None:
+            return  # ticker not in current market universe
+        event_markets = _event_groups.get(event_key, [])
 
-    affected_keys: set[str] = set()
-    for key, event_markets in groups.items():
-        for m in event_markets:
-            if m["ticker"] == ticker:
-                _now = datetime.now(timezone.utc)
-                with ws_activity_lock:
-                    ws_activity[ticker] = _now
-                    ws_event_log.append((_now, ticker))
-                affected_keys.add(key)
-                break
+    _now = datetime.now(timezone.utc)
+    with ws_activity_lock:
+        ws_activity[ticker] = _now
+        ws_event_log.append((_now, ticker))
 
-    for key in affected_keys:
-        event_markets = groups[key]
-        if len(event_markets) == 1:
-            result = compute_opportunity(event_markets[0], source=source)
-        else:
-            result = compute_multi_outcome_opportunity(event_markets, source=source)
+    if len(event_markets) == 1:
+        result = compute_opportunity(event_markets[0], source=source)
+    else:
+        result = compute_multi_outcome_opportunity(event_markets, source=source)
 
-        if not result:
-            continue
+    if not result:
+        return
 
-        k = result["ticker"]
+    k = result["ticker"]
 
-        if result["category"] == "opportunity":
-            if result["has_zero_size"]:
-                save_opportunity(result)
-                logger.debug("WS opportunity [zero-size suppressed]  ticker=%s  net=%.3f%%",
-                             k, result["net_profit"] * 100)
-                continue
+    if result["category"] == "opportunity":
+        if result["has_zero_size"]:
+            save_opportunity(result)
+            logger.debug("WS opportunity [zero-size suppressed]  ticker=%s  net=%.3f%%",
+                         k, result["net_profit"] * 100)
+            return
 
-            if not _ws_should_alert(k, result["net_profit"]):
-                logger.debug("WS cooldown hit  ticker=%s  net=%.3f%%", k, result["net_profit"] * 100)
-                continue
+        if not _ws_should_alert(k, result["net_profit"]):
+            logger.debug("WS cooldown hit  ticker=%s  net=%.3f%%", k, result["net_profit"] * 100)
+            return
 
-            row_id = save_opportunity(result)
-            mins = _minutes_to_close(result.get("close_time"))
-            if mins is not None and mins < EXPIRING_SOON_MINS:
-                if (5 <= mins < EXPIRING_SOON_MINS
-                        and result["net_profit"] >= EXPIRING_ACTIONABLE_MIN_PROFIT
-                        and all(s >= MIN_LEG_SIZE for s in result["ask_sizes"])):
-                    alert_expiring_actionable(result, mins)
-                    logger.info("WS EXPIRING_ACTIONABLE #%d  %.0f min  net=%.3f%%",
-                                row_id, mins, result["net_profit"] * 100)
-                else:
-                    logger.info("WS expiring [suppressed] #%d  %.0f min  net=%.3f%%",
-                                row_id, mins, result["net_profit"] * 100)
+        row_id = save_opportunity(result)
+        mins = _minutes_to_close(result.get("close_time"))
+        if mins is not None and mins < EXPIRING_SOON_MINS:
+            if (5 <= mins < EXPIRING_SOON_MINS
+                    and result["net_profit"] >= EXPIRING_ACTIONABLE_MIN_PROFIT
+                    and all(s >= MIN_LEG_SIZE for s in result["ask_sizes"])):
+                alert_expiring_actionable(result, mins)
+                logger.info("WS EXPIRING_ACTIONABLE #%d  %.0f min  net=%.3f%%",
+                            row_id, mins, result["net_profit"] * 100)
             else:
-                alert(result)
-                logger.info("WS opportunity #%d  net=%.3f%%", row_id, result["net_profit"] * 100)
+                logger.info("WS expiring [suppressed] #%d  %.0f min  net=%.3f%%",
+                            row_id, mins, result["net_profit"] * 100)
+        else:
+            alert(result)
+            logger.info("WS opportunity #%d  net=%.3f%%", row_id, result["net_profit"] * 100)
 
-        else:  # near_miss
-            if not _ws_should_alert(k, result["net_profit"]):
-                logger.debug("WS cooldown hit (near-miss)  ticker=%s", k)
-                continue
-            row_id = save_opportunity(result)
-            alert_near_miss(result)
-            logger.info("WS near-miss  #%d  net=%.3f%%", row_id, result["net_profit"] * 100)
+    else:  # near_miss
+        if not _ws_should_alert(k, result["net_profit"]):
+            logger.debug("WS cooldown hit (near-miss)  ticker=%s", k)
+            return
+        row_id = save_opportunity(result)
+        alert_near_miss(result)
+        logger.info("WS near-miss  #%d  net=%.3f%%", row_id, result["net_profit"] * 100)
 
 
 # ---------------------------------------------------------------------------
@@ -798,6 +989,7 @@ def market_refresh_loop(ws_client: Optional[KalshiWSClient], stop_event: threadi
                 markets = fetch_active_markets()
                 new_tickers: dict[str, dict] = {m["ticker"]: m for m in markets}
                 last_full_rescan = now_ts
+                save_markets_cache(new_tickers)
             else:
                 # Fast path: re-fetch only known tickers to update prices + detect closures
                 known = list(markets_by_ticker.keys())
@@ -853,6 +1045,7 @@ def market_refresh_loop(ws_client: Optional[KalshiWSClient], stop_event: threadi
                 ws_client.update_subscriptions(pri + remaining)
 
             logger.info("Market list updated: %d markets tracked", len(markets_by_ticker))
+            _rebuild_event_groups()
             _log_market_composition()
 
         except Exception as exc:
@@ -904,6 +1097,33 @@ def main() -> None:
     # markets_by_ticker gracefully (no-op until markets arrive).
     logger.info("Starting background initial market scan …")
     def _initial_load():
+        # ── Phase 1: instant start from DB cache ────────────────────────────
+        cached = load_markets_from_cache()
+        if cached:
+            for m in cached:
+                markets_by_ticker[m["ticker"]] = m
+                with prices_lock:
+                    if m["ticker"] not in live_prices:
+                        live_prices[m["ticker"]] = {
+                            "yes_ask":      m.get("seed_yes_ask"),
+                            "yes_ask_size": m.get("seed_yes_ask_size", 0.0),
+                            "no_ask":       m.get("seed_no_ask"),
+                            "no_ask_size":  m.get("seed_no_ask_size", 0.0),
+                        }
+            _rebuild_event_groups()
+            logger.info(
+                "Loaded %d markets from DB cache — bot scanning immediately. "
+                "Live API scan running in background…",
+                len(cached),
+            )
+            if _ws_client is not None:
+                _ws_client.update_subscriptions(list(markets_by_ticker.keys()))
+                logger.info("WS subscriptions primed from cache: %d tickers",
+                            len(markets_by_ticker))
+        else:
+            logger.info("No DB cache found — waiting for full API scan…")
+
+        # ── Phase 2: full API scan to refresh & update cache ────────────────
         try:
             markets = fetch_active_markets()
             for m in markets:
@@ -916,10 +1136,25 @@ def main() -> None:
                             "no_ask":       m.get("seed_no_ask"),
                             "no_ask_size":  m.get("seed_no_ask_size", 0.0),
                         }
-            logger.info("Initial market scan complete: %d markets loaded", len(markets_by_ticker))
+            _rebuild_event_groups()
+            save_markets_cache(markets_by_ticker)
+            logger.info(
+                "API scan complete: %d markets loaded, cache updated (%d rows)",
+                len(markets_by_ticker), markets_cache_count(),
+            )
             _log_market_composition()
+
+            # Push fresh subscription list to WS now that we have markets.
+            # (WS started with an empty list because markets load async.)
+            if _ws_client is not None:
+                all_t = list(markets_by_ticker.keys())
+                with priority_lock:
+                    pri = [t for t in priority_tickers if t in set(all_t)]
+                remaining = [t for t in all_t if t not in priority_tickers]
+                _ws_client.update_subscriptions(pri + remaining)
+                logger.info("WS subscriptions updated: %d tickers", len(all_t))
         except Exception as exc:
-            logger.error("Initial market scan failed: %s", exc)
+            logger.error("Initial API market scan failed: %s", exc)
 
     threading.Thread(target=_initial_load, daemon=True, name="initial-load").start()
 

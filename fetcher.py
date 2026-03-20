@@ -152,8 +152,14 @@ def fetch_active_markets() -> list[dict]:
     page = 0
     last_found_page = 0  # track when we last found an active market
 
+    now_ts = int(time.time())
     while True:
-        params: dict = {"status": "open", "limit": MARKET_PAGE_SIZE}
+        params: dict = {
+            "status":      "open",
+            "limit":       MARKET_PAGE_SIZE,
+            "mve_filter":  "exclude",       # skip sports parlay combinatorial markets
+            "min_close_ts": now_ts,         # skip already-closed markets server-side
+        }
         if cursor:
             params["cursor"] = cursor
 
@@ -245,6 +251,28 @@ def fetch_active_markets() -> list[dict]:
     return live
 
 
+def fetch_event_market_count(event_ticker: str) -> int:
+    """
+    Return the total number of open markets for an event, ignoring the
+    volume filter used by the main scanner.  Used to verify that we have
+    all outcomes before treating a multi-outcome group as arb-eligible.
+    """
+    try:
+        data = _get("/markets", params={
+            "event_ticker": event_ticker,
+            "status":       "open",
+            "limit":        200,
+        })
+        markets = data.get("markets", [])
+        # If cursor present the event has >200 outcomes — return a large sentinel
+        if data.get("cursor"):
+            return 999
+        return len(markets)
+    except Exception as exc:
+        logger.warning("fetch_event_market_count(%s) failed: %s", event_ticker, exc)
+        return 0
+
+
 def fetch_market_prices(tickers: list[str]) -> dict[str, dict]:
     """
     Batch-refresh best-ask prices for a list of tickers.
@@ -326,8 +354,17 @@ class KalshiWSClient:
     def _run(self) -> None:
         while self._running:
             try:
+                # Auth headers must be on the HTTP upgrade request itself.
+                # Sign with path "/trade-api/ws/v2" (no host, no query string).
+                headers = _auth_headers("GET", "/trade-api/ws/v2")
+                if not headers:
+                    logger.warning(
+                        "Kalshi WS: no API credentials configured — "
+                        "set KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PATH in .env"
+                    )
                 self._ws = websocket.WebSocketApp(
                     KALSHI_WS_URL,
+                    header=headers,
                     on_open=self._on_open,
                     on_message=self._on_message,
                     on_error=self._on_error,
