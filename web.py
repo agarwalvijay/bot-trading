@@ -249,13 +249,14 @@ TEMPLATE = """<!doctype html>
 </script>
 <script>
 var _currentLiveRowId = null;
+var _liveModal = null;
 function showLive(rowId) {
   _currentLiveRowId = rowId;
-  const modal = new bootstrap.Modal(document.getElementById('liveModal'));
+  if (!_liveModal) _liveModal = new bootstrap.Modal(document.getElementById('liveModal'));
   document.getElementById('liveModalTitle').textContent = 'Live Pricing';
   document.getElementById('liveModalBody').innerHTML =
     '<div class="text-center py-4"><div class="spinner-border spinner-border-sm"></div> Fetching…</div>';
-  modal.show();
+  if (!document.getElementById('liveModal').classList.contains('show')) _liveModal.show();
 
   fetch('/api/prices/' + rowId)
     .then(r => r.json())
