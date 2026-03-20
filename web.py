@@ -14,9 +14,10 @@ import re
 import sqlite3
 from datetime import datetime, timezone
 
-from flask import Flask, render_template_string, request, redirect, url_for
+from flask import Flask, render_template_string, request, redirect, url_for, jsonify
 
-from config import DB_PATH
+from config import DB_PATH, TAKER_FEE_COEFF
+from fetcher import fetch_market_prices
 
 app = Flask(__name__)
 
@@ -142,7 +143,7 @@ TEMPLATE = """<!doctype html>
             <th style="width:80px">Sum asks</th>
             <th style="width:90px">Net profit</th>
             <th style="width:60px">Src</th>
-            <th style="width:36px"></th>
+            <th style="width:52px"></th>
           </tr>
         </thead>
         <tbody>
@@ -151,8 +152,8 @@ TEMPLATE = """<!doctype html>
             <td class="text-muted text-nowrap">{{ r.time_ago }}</td>
             <td class="q">
               <a href="{{ r.kalshi_url }}" target="_blank" rel="noopener"
-                 title="{{ r.question }}" class="text-decoration-none text-dark">
-                {{ r.question[:80] }}
+                 class="text-decoration-none text-dark">
+                {{ r.question }}
               </a>
               {% if r.has_zero_size %}
                 <br><span class="badge bg-secondary">zero-size</span>
@@ -188,8 +189,10 @@ TEMPLATE = """<!doctype html>
                 {{ r.source }}
               </span>
             </td>
-            <td>
-              <form method="post" action="/delete/{{ r.row_id }}" style="margin:0"
+            <td class="text-nowrap">
+              <button class="btn btn-sm btn-link text-primary p-0 me-1" title="Live prices"
+                      onclick="showLive({{ r.row_id }})">&#8635;</button>
+              <form method="post" action="/delete/{{ r.row_id }}" style="margin:0;display:inline"
                     onsubmit="return confirm('Delete this row?');">
                 <input type="hidden" name="cat" value="{{ category }}">
                 <button type="submit" class="btn btn-sm btn-link text-danger p-0" title="Delete">&times;</button>
@@ -209,6 +212,113 @@ TEMPLATE = """<!doctype html>
   <div class="text-muted small mt-2">Showing {{ rows | length }} most recent records.</div>
 
 </div>
+
+<!-- Live prices modal -->
+<div class="modal fade" id="liveModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header py-2">
+        <h6 class="modal-title fw-bold mb-0" id="liveModalTitle">Live Pricing</h6>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body p-3" id="liveModalBody">
+        <div class="text-center py-4"><div class="spinner-border spinner-border-sm"></div> Fetching…</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+function showLive(rowId) {
+  const modal = new bootstrap.Modal(document.getElementById('liveModal'));
+  document.getElementById('liveModalTitle').textContent = 'Live Pricing';
+  document.getElementById('liveModalBody').innerHTML =
+    '<div class="text-center py-4"><div class="spinner-border spinner-border-sm"></div> Fetching…</div>';
+  modal.show();
+
+  fetch('/api/prices/' + rowId)
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) {
+        document.getElementById('liveModalBody').innerHTML =
+          '<div class="text-danger">' + data.error + '</div>';
+        return;
+      }
+      document.getElementById('liveModalTitle').textContent = data.title;
+
+      const fmtPct = v => v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(2) + '%';
+      const fmtP   = v => v == null ? '—' : v.toFixed(4);
+      const arrow  = (curr, logged) => {
+        if (curr == null || logged == null) return '';
+        const d = curr - logged;
+        if (Math.abs(d) < 0.0005) return '<span class="text-muted">→</span>';
+        return d > 0
+          ? '<span class="text-danger">▲ +' + (d * 100).toFixed(2) + '%</span>'
+          : '<span class="text-success">▼ ' + (d * 100).toFixed(2) + '%</span>';
+      };
+
+      // Close time
+      let closeHtml = '';
+      if (data.time_to_close != null) {
+        const h = Math.floor(data.time_to_close / 3600);
+        const m = Math.floor((data.time_to_close % 3600) / 60);
+        const label = data.time_to_close < 0 ? 'Expired' :
+                      h > 0 ? h + 'h ' + m + 'm remaining' : m + 'm remaining';
+        const cls = data.time_to_close < 3600 ? 'text-danger fw-bold' :
+                    data.time_to_close < 14400 ? 'text-warning fw-semibold' : 'text-success';
+        closeHtml = '<span class="' + cls + '">' + label + '</span>';
+        if (data.close_time) closeHtml += ' <span class="text-muted small">(' + data.close_time.replace('T',' ').slice(0,16) + ' UTC)</span>';
+      }
+
+      // Legs table
+      let rows = data.legs.map(l =>
+        '<tr>' +
+        '<td class="text-muted" style="font-size:0.8rem">' + l.outcome + '</td>' +
+        '<td class="text-muted">' + fmtP(l.logged_price) + '</td>' +
+        '<td class="fw-semibold">' + fmtP(l.current_price) + '</td>' +
+        '<td>' + arrow(l.current_price, l.logged_price) + '</td>' +
+        '<td class="text-muted">' + (l.current_size != null ? Math.round(l.current_size) : '—') + '</td>' +
+        '</tr>'
+      ).join('');
+
+      // Summary row
+      const sumArrow = arrow(data.current_sum, data.logged_sum);
+      const profitCls = data.current_net_profit == null ? '' :
+                        data.current_net_profit >= 0.005 ? 'text-success fw-bold' :
+                        data.current_net_profit >= 0 ? 'text-warning fw-semibold' : 'text-muted';
+
+      document.getElementById('liveModalBody').innerHTML = `
+        <div class="mb-2 d-flex justify-content-between align-items-center">
+          <div>${closeHtml || '<span class="text-muted">No close time</span>'}</div>
+          <div class="text-muted small">Fetched just now</div>
+        </div>
+        <table class="table table-sm table-bordered mb-2" style="font-size:0.85rem">
+          <thead class="table-secondary">
+            <tr><th>Outcome</th><th>Logged ask</th><th>Current ask</th><th>Change</th><th>Size</th></tr>
+          </thead>
+          <tbody>${rows}</tbody>
+          <tfoot class="table-light fw-semibold">
+            <tr>
+              <td>Sum</td>
+              <td>${fmtP(data.logged_sum)}</td>
+              <td>${fmtP(data.current_sum)}</td>
+              <td>${sumArrow}</td>
+              <td></td>
+            </tr>
+          </tfoot>
+        </table>
+        <div class="d-flex gap-4">
+          <div>Logged net profit: <strong>${fmtPct(data.logged_net_profit)}</strong></div>
+          <div>Current net profit: <strong class="${profitCls}">${fmtPct(data.current_net_profit)}</strong></div>
+        </div>`;
+    })
+    .catch(err => {
+      document.getElementById('liveModalBody').innerHTML =
+        '<div class="text-danger">Request failed: ' + err + '</div>';
+    });
+}
+</script>
 </body>
 </html>"""
 
@@ -356,6 +466,103 @@ def delete_row(row_id: int):
     except Exception:
         pass
     return redirect(url_for("index", cat=cat) if cat else url_for("index"))
+
+
+@app.route("/api/prices/<int:row_id>")
+def api_prices(row_id: int):
+    """Return current live prices for a logged opportunity row."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        row = con.execute("SELECT * FROM opportunities WHERE id = ?", (row_id,)).fetchone()
+        if not row:
+            con.close()
+            return jsonify({"error": "Row not found"}), 404
+
+        event_ticker  = row["event_ticker"] or row["ticker"]
+        logged_prices = json.loads(row["ask_prices"] or "[]")
+        outcomes      = json.loads(row["outcomes"]   or "[]")
+        close_time    = row["close_time"]
+
+        # Look up individual tickers for this event in the markets cache
+        if row["event_ticker"]:
+            cache_rows = con.execute(
+                "SELECT ticker, title, close_time FROM markets_cache WHERE event_ticker = ?",
+                (event_ticker,),
+            ).fetchall()
+        else:
+            cache_rows = con.execute(
+                "SELECT ticker, title, close_time FROM markets_cache WHERE ticker = ?",
+                (event_ticker,),
+            ).fetchall()
+
+        # Fall back to close_time from cache if not stored on the opportunity
+        if not close_time and cache_rows:
+            close_time = cache_rows[0]["close_time"]
+
+        con.close()
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    # Fetch current prices from Kalshi API
+    tickers = [r["ticker"] for r in cache_rows]
+    if not tickers:
+        return jsonify({"error": "Tickers not found in cache — run a market refresh first"}), 404
+
+    try:
+        current = fetch_market_prices(tickers)
+    except Exception as exc:
+        return jsonify({"error": f"Kalshi API error: {exc}"}), 502
+
+    # Match current prices to outcomes by title (outcomes stored as title[:60])
+    title_to_row = {r["title"][:60]: r for r in cache_rows}
+
+    legs = []
+    for i, outcome in enumerate(outcomes):
+        cache_row   = title_to_row.get(outcome)
+        ticker      = cache_row["ticker"] if cache_row else None
+        logged_p    = logged_prices[i] if i < len(logged_prices) else None
+        curr_entry  = current.get(ticker, {}) if ticker else {}
+        curr_price  = curr_entry.get("yes_ask")
+        curr_size   = curr_entry.get("yes_ask_size")
+        legs.append({
+            "outcome":       outcome,
+            "logged_price":  logged_p,
+            "current_price": curr_price,
+            "current_size":  curr_size,
+        })
+
+    # Compute current sum + net profit if we have all prices
+    curr_prices = [l["current_price"] for l in legs]
+    if all(p is not None for p in curr_prices):
+        curr_sum     = sum(curr_prices)
+        gross        = 1.0 - curr_sum
+        fees         = sum(TAKER_FEE_COEFF * p * (1 - p) for p in curr_prices)
+        curr_net     = gross - fees
+    else:
+        curr_sum = curr_net = None
+
+    # Time to close in seconds
+    time_to_close = None
+    if close_time:
+        try:
+            ct = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+            if ct.tzinfo is None:
+                ct = ct.replace(tzinfo=timezone.utc)
+            time_to_close = int((ct - datetime.now(timezone.utc)).total_seconds())
+        except Exception:
+            pass
+
+    return jsonify({
+        "title":              row["title"],
+        "legs":               legs,
+        "logged_sum":         row["sum_asks"],
+        "logged_net_profit":  row["net_profit"],
+        "current_sum":        curr_sum,
+        "current_net_profit": curr_net,
+        "close_time":         close_time,
+        "time_to_close":      time_to_close,
+    })
 
 
 if __name__ == "__main__":
