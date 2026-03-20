@@ -1164,6 +1164,8 @@ def _get_trades(limit: int = 100) -> tuple[list, dict]:
 def delete_trade(trade_id: int):
     try:
         con = sqlite3.connect(DB_PATH)
+        # Clear trade_id on the linked opportunity so it can be retried
+        con.execute("UPDATE opportunities SET trade_id = NULL WHERE trade_id = ?", (trade_id,))
         con.execute("DELETE FROM trades WHERE id = ?", (trade_id,))
         con.commit()
         con.close()
