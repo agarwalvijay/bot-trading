@@ -1125,7 +1125,11 @@ def market_refresh_loop(ws_client: Optional[KalshiWSClient], stop_event: threadi
             if do_full:
                 logger.info("Running full market rescan…")
                 markets = fetch_active_markets()
-                _prewarm_event_size_cache(markets)
+                _prewarm_event_size_cache(markets)  # prewarm before any cap
+                # Apply MAX_MARKETS cap (highest volume first) for scanning only
+                if MAX_MARKETS:
+                    markets.sort(key=lambda m: m["volume_24h"], reverse=True)
+                    markets = markets[:MAX_MARKETS]
                 new_tickers: dict[str, dict] = {
                     m["ticker"]: m for m in markets
                     if MIN_VOLUME_24H <= 0 or float(m.get("volume_24h", 0) or 0) >= MIN_VOLUME_24H
@@ -1278,7 +1282,13 @@ def main() -> None:
     logger.info("Starting background initial market scan …")
     def _initial_load():
         # ── Phase 1: instant start from DB cache ────────────────────────────
-        cached = load_markets_from_cache(min_volume_24h=MIN_VOLUME_24H)
+        # Load full (unfiltered) cache first to prewarm event-size counts, then
+        # apply the volume filter for active scanning. This ensures completeness
+        # checks work correctly during the window before Phase 2 finishes.
+        all_cached = load_markets_from_cache(min_volume_24h=0)
+        if all_cached:
+            _prewarm_event_size_cache(all_cached)
+        cached = [m for m in all_cached if MIN_VOLUME_24H <= 0 or float(m.get("volume_24h", 0) or 0) >= MIN_VOLUME_24H] if all_cached else []
         if cached:
             for m in cached:
                 markets_by_ticker[m["ticker"]] = m
@@ -1306,7 +1316,10 @@ def main() -> None:
         # ── Phase 2: full API scan to refresh & update cache ────────────────
         try:
             markets = fetch_active_markets()
-            _prewarm_event_size_cache(markets)
+            _prewarm_event_size_cache(markets)  # prewarm before any cap
+            if MAX_MARKETS:
+                markets.sort(key=lambda m: m["volume_24h"], reverse=True)
+                markets = markets[:MAX_MARKETS]
             for m in markets:
                 markets_by_ticker[m["ticker"]] = m
                 with prices_lock:

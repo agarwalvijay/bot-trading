@@ -315,7 +315,6 @@ def fetch_active_markets() -> list[dict]:
         params: dict = {
             "status":       "open",
             "limit":        MARKET_PAGE_SIZE,
-            "mve_filter":   "exclude",
             "min_close_ts": now_ts,
         }
         if cursor:
@@ -343,9 +342,7 @@ def fetch_active_markets() -> list[dict]:
 
         time.sleep(0.1)  # 100ms between listing pages to stay within rate limits
 
-    # Sort by 24h volume descending so MAX_MARKETS cap keeps the most liquid
-    markets.sort(key=lambda m: m["volume_24h"], reverse=True)
-    result = markets[:MAX_MARKETS] if MAX_MARKETS else markets
+    result = markets
 
     # Drop markets that closed more than 1 hour ago
     one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
