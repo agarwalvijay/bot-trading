@@ -155,6 +155,9 @@ TEMPLATE = """<!doctype html>
                  class="text-decoration-none text-dark">
                 {{ r.question }}
               </a>
+              {% if r.closes_in.label %}
+                <br><span class="small {{ r.closes_in.css }}">{{ r.closes_in.label }}</span>
+              {% endif %}
               {% if r.has_zero_size %}
                 <br><span class="badge bg-secondary">zero-size</span>
               {% endif %}
@@ -343,6 +346,32 @@ def _time_ago(iso_str: str) -> str:
         return iso_str[:16]
 
 
+def _closes_in(close_time: str) -> dict:
+    """Return a dict with label and css class for time-to-close display."""
+    if not close_time:
+        return {"label": "", "css": ""}
+    try:
+        ct = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+        if ct.tzinfo is None:
+            ct = ct.replace(tzinfo=timezone.utc)
+        secs = int((ct - datetime.now(timezone.utc)).total_seconds())
+        if secs < 0:
+            return {"label": "expired", "css": "text-muted"}
+        if secs < 3600:
+            m = secs // 60
+            return {"label": f"closes {m}m", "css": "text-danger fw-semibold"}
+        if secs < 86400:
+            h = secs // 3600
+            m = (secs % 3600) // 60
+            label = f"closes {h}h {m}m" if m else f"closes {h}h"
+            css = "text-warning fw-semibold" if secs < 14400 else "text-muted"
+            return {"label": label, "css": css}
+        d = secs // 86400
+        return {"label": f"closes {d}d", "css": "text-muted"}
+    except Exception:
+        return {"label": "", "css": ""}
+
+
 def _get_rows(category=None, limit: int = 200) -> list:
     try:
         con = sqlite3.connect(DB_PATH)
@@ -392,16 +421,17 @@ def _get_rows(category=None, limit: int = 200) -> list:
             url_slug = event_ticker.lower()
         kalshi_url = f"https://kalshi.com/markets/{url_slug}"
         rows.append({
-            "row_id":      r["id"],
-            "time_ago":    _time_ago(r["detected_at"]),
-            "question":    r["title"],
-            "kalshi_url":  kalshi_url,
-            "legs":        legs,
-            "sum_asks":    r["sum_asks"],
-            "net_profit":  r["net_profit"],
-            "source":      r["source"],
-            "category":    r["category"],
+            "row_id":        r["id"],
+            "time_ago":      _time_ago(r["detected_at"]),
+            "question":      r["title"],
+            "kalshi_url":    kalshi_url,
+            "legs":          legs,
+            "sum_asks":      r["sum_asks"],
+            "net_profit":    r["net_profit"],
+            "source":        r["source"],
+            "category":      r["category"],
             "has_zero_size": r["has_zero_size"],
+            "closes_in":     _closes_in(r["close_time"]),
         })
     return rows
 
