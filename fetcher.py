@@ -152,7 +152,10 @@ def _post(path: str, body: dict) -> Any:
     url = f"{_trade_base()}{path}"
     headers = _auth_headers("POST", _trade_sign_path(path), demo=DEMO_MODE)
     headers["Content-Type"] = "application/json"
+    logger.debug("POST %s body=%s", url, body)
     resp = SESSION.post(url, json=body, headers=headers, timeout=15)
+    if not resp.ok:
+        logger.error("POST %s → %d: %s", url, resp.status_code, resp.text)
     resp.raise_for_status()
     return resp.json()
 
