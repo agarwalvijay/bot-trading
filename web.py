@@ -140,6 +140,11 @@ TEMPLATE = """<!doctype html>
       <a class="nav-link {{ 'active fw-semibold' if category == 'ignored' }}"
          href="/?cat=ignored">Ignored</a>
     </li>
+    {% if trading_enabled %}
+    <li class="nav-item ms-auto">
+      <a class="nav-link text-success fw-semibold" href="/trades">&#9889; Trades</a>
+    </li>
+    {% endif %}
   </ul>
 
   <!-- Table -->
@@ -390,6 +395,172 @@ function showLive(rowId) {
 </script>
 </body>
 </html>"""
+
+# ---------------------------------------------------------------------------
+# Trades template
+# ---------------------------------------------------------------------------
+
+TRADES_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kalshi Arb — Trades</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { font-size: 0.875rem; background: #f8f9fa; }
+    .stat-card { min-width: 120px; }
+    td.small-mono { font-size: 0.78rem; font-family: monospace; }
+  </style>
+</head>
+<body>
+<div class="container-fluid py-3 px-4">
+
+  <!-- Header -->
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <h5 class="mb-0 fw-bold">&#9889; Trades</h5>
+    <div class="d-flex align-items-center gap-3">
+      <span class="text-muted small">{{ now }}</span>
+      <button class="btn btn-sm btn-link text-muted p-0" onclick="location.reload()" title="Refresh">&#8635;</button>
+      <a href="/" class="btn btn-sm btn-outline-secondary">&#8592; Opportunities</a>
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div class="row g-2 mb-3">
+    <div class="col-auto">
+      <div class="card stat-card text-center px-3 py-2">
+        <div class="text-muted small">Total trades</div>
+        <div class="fs-5 fw-bold">{{ stats.total }}</div>
+      </div>
+    </div>
+    <div class="col-auto">
+      <div class="card stat-card text-center px-3 py-2">
+        <div class="text-muted small">Complete</div>
+        <div class="fs-5 fw-bold text-success">{{ stats.complete }}</div>
+      </div>
+    </div>
+    <div class="col-auto">
+      <div class="card stat-card text-center px-3 py-2">
+        <div class="text-muted small">In progress</div>
+        <div class="fs-5 fw-bold text-primary">{{ stats.in_progress }}</div>
+      </div>
+    </div>
+    <div class="col-auto">
+      <div class="card stat-card text-center px-3 py-2">
+        <div class="text-muted small">Unwound</div>
+        <div class="fs-5 fw-bold text-warning">{{ stats.unwound }}</div>
+      </div>
+    </div>
+    <div class="col-auto">
+      <div class="card stat-card text-center px-3 py-2">
+        <div class="text-muted small">Failed/Aborted</div>
+        <div class="fs-5 fw-bold text-danger">{{ stats.failed }}</div>
+      </div>
+    </div>
+    <div class="col-auto">
+      <div class="card stat-card text-center px-3 py-2">
+        <div class="text-muted small">Total net PnL</div>
+        <div class="fs-5 fw-bold {{ 'text-success' if stats.total_net_pnl >= 0 else 'text-danger' }}">
+          ${{ "%.4f" | format(stats.total_net_pnl) }}
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Table -->
+  <div class="card">
+    <div class="table-responsive">
+      <table class="table table-sm table-hover align-middle mb-0">
+        <thead class="table-dark">
+          <tr>
+            <th style="width:50px">#</th>
+            <th style="width:70px">Mode</th>
+            <th style="width:110px">Status</th>
+            <th>Opportunity</th>
+            <th style="width:90px">Started</th>
+            <th style="width:90px">Completed</th>
+            <th>Legs / Fills</th>
+            <th style="width:90px">Net PnL</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for t in trades %}
+          <tr>
+            <td class="text-muted">{{ t.id }}</td>
+            <td>
+              {% if t.demo_mode %}
+                <span class="badge bg-info text-dark">DEMO</span>
+              {% else %}
+                <span class="badge bg-danger">LIVE</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if t.status == 'complete' %}
+                <span class="badge bg-success">complete</span>
+              {% elif t.status in ('phase1_placed', 'phase2_placed') %}
+                <span class="badge bg-primary">{{ t.status }}</span>
+              {% elif t.status == 'phase1_filled' %}
+                <span class="badge bg-info text-dark">phase1 filled</span>
+              {% elif t.status == 'preflight_failed' %}
+                <span class="badge bg-secondary">preflight failed</span>
+              {% elif t.status == 'aborted' %}
+                <span class="badge bg-danger">aborted</span>
+              {% elif t.status.startswith('unwind') %}
+                <span class="badge bg-warning text-dark">{{ t.status }}</span>
+              {% else %}
+                <span class="badge bg-secondary">{{ t.status }}</span>
+              {% endif %}
+            </td>
+            <td class="small-mono">{{ t.opp_title }}</td>
+            <td class="text-muted text-nowrap">{{ t.started_ago }}</td>
+            <td class="text-muted text-nowrap">{{ t.completed_ago }}</td>
+            <td class="small-mono">
+              {% for leg in t.legs %}
+              <div>
+                <span class="text-muted">{{ leg.ticker.split('-')[0] }}…</span>
+                {% if leg.fill_price %}
+                  filled <strong>{{ leg.fill_count }}×</strong> @ {{ "%.4f" | format(leg.fill_price) }}
+                {% else %}
+                  target {{ "%.4f" | format(leg.target_price) }}
+                {% endif %}
+              </div>
+              {% endfor %}
+            </td>
+            <td>
+              {% if t.net_pnl is not none %}
+                <span class="{{ 'text-success fw-bold' if t.net_pnl >= 0 else 'text-danger fw-bold' }}">
+                  {{ "%+.4f" | format(t.net_pnl) }}
+                </span>
+              {% else %}
+                <span class="text-muted">—</span>
+              {% endif %}
+            </td>
+            <td class="text-muted small">
+              {{ t.notes or '' }}
+              {{ t.unwind_reason or '' }}
+            </td>
+          </tr>
+          {% endfor %}
+          {% if not trades %}
+          <tr>
+            <td colspan="9" class="text-center text-muted py-5">No trades yet.</td>
+          </tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  <div class="text-muted small mt-2">Showing {{ trades | length }} most recent trades. Auto-refreshes every 10s.</div>
+
+</div>
+<script>
+setTimeout(function() { location.reload(); }, 10000);
+</script>
+</body>
+</html>"""
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -702,6 +873,87 @@ def api_prices(row_id: int):
         "close_time":         close_time,
         "time_to_close":      time_to_close,
     })
+
+
+def _get_trades(limit: int = 100) -> tuple[list, dict]:
+    """Return trade rows and summary stats."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        raw = con.execute("""
+            SELECT t.*, o.title as opp_title
+            FROM trades t
+            LEFT JOIN opportunities o ON t.opportunity_id = o.id
+            ORDER BY t.id DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        con.close()
+    except Exception:
+        return [], {"total": 0, "complete": 0, "in_progress": 0,
+                    "unwound": 0, "failed": 0, "total_net_pnl": 0.0}
+
+    trades = []
+    stats = {"total": 0, "complete": 0, "in_progress": 0,
+             "unwound": 0, "failed": 0, "total_net_pnl": 0.0}
+
+    in_progress_statuses = {"phase1_placed", "phase1_filled", "phase2_placed", "unwind_retry"}
+    unwind_statuses      = {"unwind_limit", "unwind_market", "unwind_hold", "unwind_failed"}
+    failed_statuses      = {"preflight_failed", "aborted"}
+
+    for r in raw:
+        status = r["status"] or ""
+        stats["total"] += 1
+        if status == "complete":
+            stats["complete"] += 1
+        elif status in in_progress_statuses:
+            stats["in_progress"] += 1
+        elif status in unwind_statuses:
+            stats["unwound"] += 1
+        elif status in failed_statuses:
+            stats["failed"] += 1
+
+        if r["net_pnl"] is not None:
+            stats["total_net_pnl"] += r["net_pnl"]
+
+        # Parse leg arrays for display
+        try:
+            leg_tickers    = json.loads(r["leg_tickers"]    or "[]")
+            target_prices  = json.loads(r["target_prices"]  or "[]")
+            fill_prices_l  = json.loads(r["fill_prices"]    or "[]")
+            fill_counts_l  = json.loads(r["fill_counts"]    or "[]")
+        except Exception:
+            leg_tickers = target_prices = fill_prices_l = fill_counts_l = []
+
+        legs = []
+        for i, ticker in enumerate(leg_tickers):
+            legs.append({
+                "ticker":       ticker,
+                "target_price": target_prices[i] if i < len(target_prices) else None,
+                "fill_price":   fill_prices_l[i]  if i < len(fill_prices_l)  else None,
+                "fill_count":   fill_counts_l[i]  if i < len(fill_counts_l)  else None,
+            })
+
+        trades.append({
+            "id":            r["id"],
+            "status":        status,
+            "demo_mode":     bool(r["demo_mode"]),
+            "opp_title":     r["opp_title"] or f"opp #{r['opportunity_id']}",
+            "started_ago":   _time_ago(r["started_at"]),
+            "completed_ago": _time_ago(r["completed_at"]) if r["completed_at"] else "—",
+            "legs":          legs,
+            "net_pnl":       r["net_pnl"],
+            "notes":         r["notes"],
+            "unwind_reason": r["unwind_reason"],
+        })
+
+    return trades, stats
+
+
+@app.route("/trades")
+def trades_page():
+    trades, stats = _get_trades()
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return render_template_string(TRADES_TEMPLATE, trades=trades, stats=stats, now=now)
 
 
 if __name__ == "__main__":
