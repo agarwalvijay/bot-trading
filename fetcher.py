@@ -15,6 +15,7 @@ import threading
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -131,10 +132,20 @@ def _trade_base() -> str:
     return DEMO_BASE_URL if DEMO_MODE else KALSHI_BASE_URL
 
 
+def _trade_sign_path(path: str) -> str:
+    """
+    Full URL path to use when signing trading requests.
+    Kalshi requires signing the complete path including the /trade-api/v2 prefix.
+    e.g. /portfolio/orders → /trade-api/v2/portfolio/orders
+    """
+    base_path = urlparse(_trade_base()).path  # e.g. /trade-api/v2
+    return base_path + path
+
+
 def _post(path: str, body: dict) -> Any:
     """Authenticated POST to the trading API (no retry — orders must not be duplicated)."""
     url = f"{_trade_base()}{path}"
-    headers = _auth_headers("POST", path)
+    headers = _auth_headers("POST", _trade_sign_path(path))
     headers["Content-Type"] = "application/json"
     resp = SESSION.post(url, json=body, headers=headers, timeout=15)
     resp.raise_for_status()
@@ -144,7 +155,7 @@ def _post(path: str, body: dict) -> Any:
 def _delete(path: str) -> Any:
     """Authenticated DELETE to the trading API."""
     url = f"{_trade_base()}{path}"
-    headers = _auth_headers("DELETE", path)
+    headers = _auth_headers("DELETE", _trade_sign_path(path))
     resp = SESSION.delete(url, headers=headers, timeout=15)
     resp.raise_for_status()
     return resp.json()
@@ -189,8 +200,9 @@ def place_order(ticker: str, action: str, side: str, count: int,
 
 def get_order(order_id: str) -> dict:
     """Fetch the current state of an order by its Kalshi order ID."""
-    url = f"{_trade_base()}/portfolio/orders/{order_id}"
-    headers = _auth_headers("GET", f"/portfolio/orders/{order_id}")
+    path = f"/portfolio/orders/{order_id}"
+    url = f"{_trade_base()}{path}"
+    headers = _auth_headers("GET", _trade_sign_path(path))
     resp = SESSION.get(url, headers=headers, timeout=10)
     resp.raise_for_status()
     data = resp.json()
