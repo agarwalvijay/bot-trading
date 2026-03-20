@@ -30,7 +30,6 @@ TEMPLATE = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="30">
   <title>Kalshi Arb</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <style>
@@ -50,7 +49,8 @@ TEMPLATE = """<!doctype html>
   <div class="d-flex justify-content-between align-items-center mb-3">
     <h5 class="mb-0 fw-bold">Kalshi Arb Monitor</h5>
     <div class="d-flex align-items-center gap-3">
-      <span class="text-muted small">auto-refresh 30s &mdash; {{ now }}</span>
+      <span class="text-muted small">{{ now }} &mdash; refresh in <span id="countdown">30</span>s</span>
+      <button class="btn btn-sm btn-link text-muted p-0" onclick="location.reload()" title="Refresh now">&#8635;</button>
       <form method="post" action="/clear" onsubmit="return confirm('Clear {{ category.replace(\"_\", \" \").title() + \" opportunities\" if category else \"ALL logged opportunities\" }}? This cannot be undone.');">
         <input type="hidden" name="cat" value="{{ category }}">
         <button type="submit" class="btn btn-sm btn-outline-danger">Clear {{ category.replace("_", " ").title() if category else "All" }}</button>
@@ -232,6 +232,17 @@ TEMPLATE = """<!doctype html>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+(function() {
+  var secs = 30;
+  var el = document.getElementById('countdown');
+  var iv = setInterval(function() {
+    secs--;
+    if (secs <= 0) { clearInterval(iv); location.reload(); }
+    else { el.textContent = secs; }
+  }, 1000);
+})();
+</script>
 <script>
 function showLive(rowId) {
   const modal = new bootstrap.Modal(document.getElementById('liveModal'));
