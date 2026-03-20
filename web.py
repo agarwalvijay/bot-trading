@@ -387,9 +387,9 @@ def _get_rows(category=None, limit: int = 200) -> list:
             # e.g. KXNHLSPREAD-26MAR19CHIMIN → kxnhlgame-26mar19chimin
             url_slug = re.sub(r"SPREAD", "GAME", event_ticker, flags=re.IGNORECASE).lower()
         else:
-            # Link to the event/series — strip from first date segment
-            # e.g. KXNASDAQ100Y-26DEC31H1600 → kxnasdaq100y
-            url_slug = re.sub(r"-\d{2}.*$", "", event_ticker).lower()
+            # Use full event ticker — Kalshi routes /markets/{event_ticker} to the event page
+            # e.g. KXFIFAGAME-26MAR26CZEIRL → kxfifagame-26mar26czeirl
+            url_slug = event_ticker.lower()
         kalshi_url = f"https://kalshi.com/markets/{url_slug}"
         rows.append({
             "row_id":      r["id"],
