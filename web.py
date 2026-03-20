@@ -675,11 +675,18 @@ TRADES_TEMPLATE = """<!doctype html>
             </td>
             <td>
               {% if t.is_attempting and t.opp_id %}
-              <form method="post" action="/authorize/{{ t.opp_id }}" style="margin:0">
+              <form method="post" action="/authorize/{{ t.opp_id }}" style="margin:0;display:inline">
                 <input type="hidden" name="authorize" value="0">
                 <input type="hidden" name="next" value="/trades">
                 <button type="submit" class="btn btn-sm btn-outline-danger p-0 px-1"
                         title="Deauthorize">&#9889; off</button>
+              </form>
+              {% endif %}
+              {% if not t.is_attempting and t.id %}
+              <form method="post" action="/delete-trade/{{ t.id }}" style="margin:0;display:inline"
+                    onsubmit="return confirm('Delete trade #{{ t.id }}?');">
+                <button type="submit" class="btn btn-sm btn-link text-danger p-0"
+                        title="Delete">&times;</button>
               </form>
               {% endif %}
             </td>
@@ -1151,6 +1158,18 @@ def _get_trades(limit: int = 100) -> tuple[list, dict]:
         })
 
     return trades, stats
+
+
+@app.route("/delete-trade/<int:trade_id>", methods=["POST"])
+def delete_trade(trade_id: int):
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute("DELETE FROM trades WHERE id = ?", (trade_id,))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+    return redirect(url_for("trades_page"))
 
 
 @app.route("/authorized")
