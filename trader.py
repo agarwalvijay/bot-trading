@@ -48,6 +48,7 @@ from db import (
     create_trade,
     get_authorized_opportunities,
     get_trade,
+    mark_likely_resolved,
     update_trade,
 )
 from fetcher import cancel_order, fetch_market_prices, get_order, place_order
@@ -134,6 +135,12 @@ def _preflight(opp: dict) -> tuple[Optional[dict], Optional[str]]:
         curr_price = entry.get("yes_ask")
         curr_size  = entry.get("yes_ask_size", 0.0)
         logged_p   = logged_prices[i] if i < len(logged_prices) else None
+
+        # Price at/below floor with zero size → market has likely resolved
+        if (curr_price is None or curr_price <= 0.01) and curr_size == 0:
+            reason = f"likely_resolved: {ticker} price={curr_price} size=0"
+            logger.info("preflight: %s", reason)
+            return None, reason
 
         if curr_price is None:
             reason = f"no_ask_price: {ticker}"
@@ -302,10 +309,12 @@ def execute_trade(opp: dict) -> None:
     # ── Pre-flight ───────────────────────────────────────────────────────────
     verified, abort_reason = _preflight(opp)
     if verified is None:
-        # Do NOT create a trade record — leave trade_id null so the loop
-        # retries on the next tick.  Preflight failures are transient (price
-        # drift, spread temporarily closed); the opportunity stays authorized.
-        logger.info("Preflight failed (opp_id=%d): %s — will retry", opp_id, abort_reason)
+        if abort_reason and abort_reason.startswith("likely_resolved:"):
+            mark_likely_resolved(opp_id)
+            logger.info("Auto-deauthorized likely-resolved opp_id=%d: %s", opp_id, abort_reason)
+        else:
+            # Transient failure (drift, spread closed) — leave authorized, retry next tick
+            logger.info("Preflight failed (opp_id=%d): %s — will retry", opp_id, abort_reason)
         return
 
     legs      = verified["legs"]

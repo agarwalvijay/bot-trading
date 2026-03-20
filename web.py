@@ -99,6 +99,12 @@ TEMPLATE = """<!doctype html>
     </div>
     <div class="col-auto">
       <div class="card stat-card text-center px-3 py-2">
+        <div class="text-muted small">Likely resolved</div>
+        <div class="fs-5 fw-bold" style="color:#6c3483">{{ stats.likely_resolved }}</div>
+      </div>
+    </div>
+    <div class="col-auto">
+      <div class="card stat-card text-center px-3 py-2">
         <div class="text-muted small">Ignored</div>
         <div class="fs-5 fw-bold text-muted">{{ stats.ignored }}</div>
       </div>
@@ -135,6 +141,10 @@ TEMPLATE = """<!doctype html>
     <li class="nav-item">
       <a class="nav-link {{ 'active fw-semibold' if category == 'spread_market' }}"
          href="/?cat=spread_market">Spread</a>
+    </li>
+    <li class="nav-item">
+      <a class="nav-link {{ 'active fw-semibold' if category == 'likely_resolved' }}"
+         href="/?cat=likely_resolved">Likely resolved</a>
     </li>
     <li class="nav-item">
       <a class="nav-link {{ 'active fw-semibold' if category == 'ignored' }}"
@@ -188,6 +198,8 @@ TEMPLATE = """<!doctype html>
                 <br><span class="badge" style="background:#6f42c1">NON-EXHAUSTIVE</span>
               {% elif r.category == 'spread_market' %}
                 <br><span class="badge bg-primary">SPREAD</span>
+              {% elif r.category == 'likely_resolved' %}
+                <br><span class="badge" style="background:#6c3483">LIKELY RESOLVED</span>
               {% elif r.category == 'ignored' %}
                 <br><span class="badge bg-secondary">IGNORED</span>
               {% endif %}
@@ -814,17 +826,18 @@ def _get_stats() -> dict:
         cumulative    = con.execute("SELECT COUNT(*) FROM opportunities WHERE category='cumulative'").fetchone()[0]
         non_exhaustive = con.execute("SELECT COUNT(*) FROM opportunities WHERE category='non_exhaustive'").fetchone()[0]
         spread_market  = con.execute("SELECT COUNT(*) FROM opportunities WHERE category='spread_market'").fetchone()[0]
-        ignored        = con.execute("SELECT COUNT(*) FROM opportunities WHERE category='ignored'").fetchone()[0]
+        ignored          = con.execute("SELECT COUNT(*) FROM opportunities WHERE category='ignored'").fetchone()[0]
+        likely_resolved  = con.execute("SELECT COUNT(*) FROM opportunities WHERE category='likely_resolved'").fetchone()[0]
         last          = con.execute("SELECT MAX(detected_at) FROM opportunities").fetchone()[0]
         con.close()
         return {"total": total, "opps": opps, "near_miss": near_miss,
                 "cumulative": cumulative, "non_exhaustive": non_exhaustive,
                 "spread_market": spread_market, "ignored": ignored,
-                "last_seen_ago": _time_ago(last)}
+                "likely_resolved": likely_resolved, "last_seen_ago": _time_ago(last)}
     except Exception:
         return {"total": 0, "opps": 0, "near_miss": 0,
                 "cumulative": 0, "non_exhaustive": 0, "spread_market": 0,
-                "ignored": 0, "last_seen_ago": "—"}
+                "ignored": 0, "likely_resolved": 0, "last_seen_ago": "—"}
 
 
 # ---------------------------------------------------------------------------
@@ -863,7 +876,7 @@ def set_category(row_id: int):
     cat     = request.form.get("cat", "")
     new_cat = request.form.get("new_cat", "")
     allowed = {"opportunity", "near_miss", "cumulative", "non_exhaustive",
-               "spread_market", "ignored"}
+               "spread_market", "ignored", "likely_resolved"}
     if new_cat in allowed:
         try:
             con = sqlite3.connect(DB_PATH)

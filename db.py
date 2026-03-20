@@ -327,6 +327,15 @@ def set_authorized(row_id: int, authorized: bool) -> None:
                     (1 if authorized else 0, row_id))
 
 
+def mark_likely_resolved(opp_id: int) -> None:
+    """Deauthorize and recategorize an opportunity the trader detected as likely resolved."""
+    with _conn() as con:
+        con.execute(
+            "UPDATE opportunities SET authorized = 0, category = 'likely_resolved' WHERE id = ?",
+            (opp_id,),
+        )
+
+
 def create_trade(opportunity_id: int, leg_tickers: list, leg_counts: list,
                  target_prices: list, client_order_ids: list,
                  demo_mode: bool) -> int:
