@@ -142,7 +142,10 @@ TEMPLATE = """<!doctype html>
     </li>
     {% if trading_enabled %}
     <li class="nav-item ms-auto">
-      <a class="nav-link text-success fw-semibold" href="/trades">&#9889; Trades</a>
+      <a class="nav-link text-success fw-semibold" href="/authorized">&#9889; Authorized</a>
+    </li>
+    <li class="nav-item">
+      <a class="nav-link text-success fw-semibold" href="/trades">&#128200; Trades</a>
     </li>
     {% endif %}
   </ul>
@@ -404,6 +407,119 @@ function showLive(rowId) {
 # Trades template
 # ---------------------------------------------------------------------------
 
+_TRADING_NAV = """
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <h5 class="mb-0 fw-bold">{{ page_title }}</h5>
+    <div class="d-flex align-items-center gap-3">
+      <span class="text-muted small">{{ now }}</span>
+      <button class="btn btn-sm btn-link text-muted p-0" onclick="location.reload()" title="Refresh">&#8635;</button>
+    </div>
+  </div>
+  <ul class="nav nav-tabs mb-3">
+    <li class="nav-item">
+      <a class="nav-link" href="/?cat=opportunity">&#128270; Opportunities</a>
+    </li>
+    <li class="nav-item">
+      <a class="nav-link {{ 'active fw-semibold' if active_tab == 'authorized' }}" href="/authorized">&#9889; Authorized</a>
+    </li>
+    <li class="nav-item">
+      <a class="nav-link {{ 'active fw-semibold' if active_tab == 'trades' }}" href="/trades">&#128200; Trades</a>
+    </li>
+  </ul>
+"""
+
+AUTHORIZED_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kalshi Arb — Authorized</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { font-size: 0.875rem; background: #f8f9fa; }
+    .profit-pos { color: #198754; font-weight: 700; }
+    .profit-neg { color: #6c757d; }
+    tr.attempting { background: #f0fff4 !important; }
+  </style>
+</head>
+<body>
+<div class="container-fluid py-3 px-4">
+  """ + _TRADING_NAV + """
+  <div class="card">
+    <div class="table-responsive">
+      <table class="table table-sm table-hover align-middle mb-0">
+        <thead class="table-dark">
+          <tr>
+            <th style="width:50px">ID</th>
+            <th>Market</th>
+            <th style="width:90px">Net profit</th>
+            <th style="width:110px">Closes in</th>
+            <th style="width:130px">Trade status</th>
+            <th style="width:60px"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in rows %}
+          <tr class="{{ 'attempting' if not r.trade_id }}">
+            <td class="text-muted">{{ r.opp_id }}</td>
+            <td>
+              <a href="{{ r.kalshi_url }}" target="_blank" rel="noopener"
+                 class="text-decoration-none text-dark fw-semibold">{{ r.title }}</a>
+              {% if r.closes_in.label %}
+                <br><span class="small {{ r.closes_in.css }}">{{ r.closes_in.label }}</span>
+              {% endif %}
+            </td>
+            <td class="{{ 'profit-pos' if r.net_profit >= 0.005 else 'profit-neg' }}">
+              {{ "%+.3f%%" | format(r.net_profit * 100) }}
+            </td>
+            <td>
+              {% if r.closes_in.label %}
+                <span class="small {{ r.closes_in.css }}">{{ r.closes_in.label }}</span>
+              {% else %}
+                <span class="text-muted">—</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if not r.trade_id %}
+                <span class="badge bg-success">attempting…</span>
+              {% else %}
+                <span class="text-muted small">trade #{{ r.trade_id }}</span>
+                {% if r.trade_status == 'complete' %}
+                  <span class="badge bg-success ms-1">complete</span>
+                {% elif r.trade_status == 'aborted' %}
+                  <span class="badge bg-danger ms-1">aborted</span>
+                {% elif r.trade_status and r.trade_status.startswith('unwind') %}
+                  <span class="badge bg-warning text-dark ms-1">{{ r.trade_status }}</span>
+                {% elif r.trade_status %}
+                  <span class="badge bg-primary ms-1">{{ r.trade_status }}</span>
+                {% endif %}
+              {% endif %}
+            </td>
+            <td>
+              <form method="post" action="/authorize/{{ r.opp_id }}" style="margin:0">
+                <input type="hidden" name="authorize" value="0">
+                <input type="hidden" name="next" value="/authorized">
+                <button type="submit" class="btn btn-sm btn-outline-danger p-0 px-1"
+                        title="Deauthorize">&#9889; off</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+          {% if not rows %}
+          <tr>
+            <td colspan="6" class="text-center text-muted py-5">No authorized opportunities.</td>
+          </tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  <div class="text-muted small mt-2">{{ rows | length }} authorized opportunity/ies. Auto-refreshes every 5s.</div>
+</div>
+<script>setTimeout(function() { location.reload(); }, 5000);</script>
+</body>
+</html>"""
+
 TRADES_TEMPLATE = """<!doctype html>
 <html lang="en">
 <head>
@@ -415,23 +531,20 @@ TRADES_TEMPLATE = """<!doctype html>
     body { font-size: 0.875rem; background: #f8f9fa; }
     .stat-card { min-width: 120px; }
     td.small-mono { font-size: 0.78rem; font-family: monospace; }
+    tr.attempting { background: #f0fff4 !important; }
   </style>
 </head>
 <body>
 <div class="container-fluid py-3 px-4">
-
-  <!-- Header -->
-  <div class="d-flex justify-content-between align-items-center mb-3">
-    <h5 class="mb-0 fw-bold">&#9889; Trades</h5>
-    <div class="d-flex align-items-center gap-3">
-      <span class="text-muted small">{{ now }}</span>
-      <button class="btn btn-sm btn-link text-muted p-0" onclick="location.reload()" title="Refresh">&#8635;</button>
-      <a href="/" class="btn btn-sm btn-outline-secondary">&#8592; Opportunities</a>
-    </div>
-  </div>
-
+  """ + _TRADING_NAV + """
   <!-- Stats -->
   <div class="row g-2 mb-3">
+    <div class="col-auto">
+      <div class="card stat-card text-center px-3 py-2">
+        <div class="text-muted small">Attempting</div>
+        <div class="fs-5 fw-bold text-success">{{ stats.attempting }}</div>
+      </div>
+    </div>
     <div class="col-auto">
       <div class="card stat-card text-center px-3 py-2">
         <div class="text-muted small">Total trades</div>
@@ -458,7 +571,7 @@ TRADES_TEMPLATE = """<!doctype html>
     </div>
     <div class="col-auto">
       <div class="card stat-card text-center px-3 py-2">
-        <div class="text-muted small">Failed/Aborted</div>
+        <div class="text-muted small">Aborted</div>
         <div class="fs-5 fw-bold text-danger">{{ stats.failed }}</div>
       </div>
     </div>
@@ -480,35 +593,38 @@ TRADES_TEMPLATE = """<!doctype html>
           <tr>
             <th style="width:50px">#</th>
             <th style="width:70px">Mode</th>
-            <th style="width:110px">Status</th>
+            <th style="width:120px">Status</th>
             <th>Opportunity</th>
             <th style="width:90px">Started</th>
             <th style="width:90px">Completed</th>
             <th>Legs / Fills</th>
             <th style="width:90px">Net PnL</th>
             <th>Notes</th>
+            <th style="width:70px"></th>
           </tr>
         </thead>
         <tbody>
           {% for t in trades %}
-          <tr>
-            <td class="text-muted">{{ t.id }}</td>
+          <tr class="{{ 'attempting' if t.is_attempting }}">
+            <td class="text-muted">{{ t.id or '—' }}</td>
             <td>
-              {% if t.demo_mode %}
+              {% if t.is_attempting %}
+                <span class="text-muted small">—</span>
+              {% elif t.demo_mode %}
                 <span class="badge bg-info text-dark">DEMO</span>
               {% else %}
                 <span class="badge bg-danger">LIVE</span>
               {% endif %}
             </td>
             <td>
-              {% if t.status == 'complete' %}
+              {% if t.is_attempting %}
+                <span class="badge bg-success">attempting…</span>
+              {% elif t.status == 'complete' %}
                 <span class="badge bg-success">complete</span>
               {% elif t.status in ('phase1_placed', 'phase2_placed') %}
                 <span class="badge bg-primary">{{ t.status }}</span>
               {% elif t.status == 'phase1_filled' %}
                 <span class="badge bg-info text-dark">phase1 filled</span>
-              {% elif t.status == 'preflight_failed' %}
-                <span class="badge bg-secondary">preflight failed</span>
               {% elif t.status == 'aborted' %}
                 <span class="badge bg-danger">aborted</span>
               {% elif t.status.startswith('unwind') %}
@@ -545,18 +661,28 @@ TRADES_TEMPLATE = """<!doctype html>
               {{ t.notes or '' }}
               {{ t.unwind_reason or '' }}
             </td>
+            <td>
+              {% if t.is_attempting and t.opp_id %}
+              <form method="post" action="/authorize/{{ t.opp_id }}" style="margin:0">
+                <input type="hidden" name="authorize" value="0">
+                <input type="hidden" name="next" value="/trades">
+                <button type="submit" class="btn btn-sm btn-outline-danger p-0 px-1"
+                        title="Deauthorize">&#9889; off</button>
+              </form>
+              {% endif %}
+            </td>
           </tr>
           {% endfor %}
           {% if not trades %}
           <tr>
-            <td colspan="9" class="text-center text-muted py-5">No trades yet.</td>
+            <td colspan="10" class="text-center text-muted py-5">No trades yet.</td>
           </tr>
           {% endif %}
         </tbody>
       </table>
     </div>
   </div>
-  <div class="text-muted small mt-2">Showing {{ trades | length }} most recent trades. Auto-refreshes every 10s.</div>
+  <div class="text-muted small mt-2">Showing {{ trades | length }} rows. Auto-refreshes every 10s.</div>
 
 </div>
 <script>
@@ -766,6 +892,7 @@ def delete_row(row_id: int):
 def authorize_row(row_id: int):
     cat       = request.form.get("cat", "")
     authorize = request.form.get("authorize", "1") == "1"
+    next_url  = request.form.get("next", "")
     try:
         con = sqlite3.connect(DB_PATH)
         con.execute("UPDATE opportunities SET authorized = ? WHERE id = ? AND category = 'opportunity'",
@@ -774,6 +901,8 @@ def authorize_row(row_id: int):
         con.close()
     except Exception:
         pass
+    if next_url in ("/authorized", "/trades"):
+        return redirect(next_url)
     return redirect(url_for("index", cat=cat) if cat else url_for("index"))
 
 
@@ -879,30 +1008,87 @@ def api_prices(row_id: int):
     })
 
 
+def _get_authorized_opps() -> list[dict]:
+    """Return all authorized opportunities with their current trade status."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        rows = con.execute("""
+            SELECT o.id as opp_id, o.title, o.net_profit, o.close_time,
+                   o.ticker, o.event_ticker, o.trade_id,
+                   t.status as trade_status
+            FROM opportunities o
+            LEFT JOIN trades t ON o.trade_id = t.id
+            WHERE o.authorized = 1
+            ORDER BY o.detected_at DESC
+        """).fetchall()
+        con.close()
+    except Exception:
+        return []
+
+    result = []
+    for r in rows:
+        event_ticker = r["event_ticker"] or r["ticker"]
+        ticker       = r["ticker"]
+        url_slug     = ticker.lower() if not event_ticker else event_ticker.lower()
+        kalshi_url   = f"https://kalshi.com/markets/{url_slug}"
+        result.append({
+            "opp_id":       r["opp_id"],
+            "title":        r["title"],
+            "net_profit":   r["net_profit"],
+            "closes_in":    _closes_in(r["close_time"]),
+            "kalshi_url":   kalshi_url,
+            "trade_id":     r["trade_id"],
+            "trade_status": r["trade_status"],
+        })
+    return result
+
+
 def _get_trades(limit: int = 100) -> tuple[list, dict]:
-    """Return trade rows and summary stats."""
+    """Return trade rows (with attempting rows prepended) and summary stats."""
     try:
         con = sqlite3.connect(DB_PATH)
         con.row_factory = sqlite3.Row
         raw = con.execute("""
-            SELECT t.*, o.title as opp_title
+            SELECT t.*, o.title as opp_title, o.id as opp_id
             FROM trades t
             LEFT JOIN opportunities o ON t.opportunity_id = o.id
             ORDER BY t.id DESC
             LIMIT ?
         """, (limit,)).fetchall()
+        attempting_raw = con.execute("""
+            SELECT id, title, detected_at
+            FROM opportunities
+            WHERE authorized = 1 AND (trade_id IS NULL OR trade_id = 0)
+        """).fetchall()
         con.close()
     except Exception:
-        return [], {"total": 0, "complete": 0, "in_progress": 0,
+        return [], {"attempting": 0, "total": 0, "complete": 0, "in_progress": 0,
                     "unwound": 0, "failed": 0, "total_net_pnl": 0.0}
 
     trades = []
-    stats = {"total": 0, "complete": 0, "in_progress": 0,
-             "unwound": 0, "failed": 0, "total_net_pnl": 0.0}
+    stats = {"attempting": len(attempting_raw), "total": 0, "complete": 0,
+             "in_progress": 0, "unwound": 0, "failed": 0, "total_net_pnl": 0.0}
+
+    # Prepend attempting rows at the top
+    for r in attempting_raw:
+        trades.append({
+            "id":            None,
+            "status":        "attempting",
+            "is_attempting": True,
+            "demo_mode":     False,
+            "opp_id":        r["id"],
+            "opp_title":     r["title"],
+            "started_ago":   _time_ago(r["detected_at"]),
+            "completed_ago": "—",
+            "legs":          [],
+            "net_pnl":       None,
+            "notes":         None,
+            "unwind_reason": None,
+        })
 
     in_progress_statuses = {"phase1_placed", "phase1_filled", "phase2_placed", "unwind_retry"}
     unwind_statuses      = {"unwind_limit", "unwind_market", "unwind_hold", "unwind_failed"}
-    failed_statuses      = {"aborted"}
 
     for r in raw:
         status = r["status"] or ""
@@ -913,18 +1099,17 @@ def _get_trades(limit: int = 100) -> tuple[list, dict]:
             stats["in_progress"] += 1
         elif status in unwind_statuses:
             stats["unwound"] += 1
-        elif status in failed_statuses:
+        elif status == "aborted":
             stats["failed"] += 1
 
         if r["net_pnl"] is not None:
             stats["total_net_pnl"] += r["net_pnl"]
 
-        # Parse leg arrays for display
         try:
-            leg_tickers    = json.loads(r["leg_tickers"]    or "[]")
-            target_prices  = json.loads(r["target_prices"]  or "[]")
-            fill_prices_l  = json.loads(r["fill_prices"]    or "[]")
-            fill_counts_l  = json.loads(r["fill_counts"]    or "[]")
+            leg_tickers   = json.loads(r["leg_tickers"]   or "[]")
+            target_prices = json.loads(r["target_prices"] or "[]")
+            fill_prices_l = json.loads(r["fill_prices"]   or "[]")
+            fill_counts_l = json.loads(r["fill_counts"]   or "[]")
         except Exception:
             leg_tickers = target_prices = fill_prices_l = fill_counts_l = []
 
@@ -940,7 +1125,9 @@ def _get_trades(limit: int = 100) -> tuple[list, dict]:
         trades.append({
             "id":            r["id"],
             "status":        status,
+            "is_attempting": False,
             "demo_mode":     bool(r["demo_mode"]),
+            "opp_id":        r["opp_id"],
             "opp_title":     r["opp_title"] or f"opp #{r['opportunity_id']}",
             "started_ago":   _time_ago(r["started_at"]),
             "completed_ago": _time_ago(r["completed_at"]) if r["completed_at"] else "—",
@@ -953,11 +1140,21 @@ def _get_trades(limit: int = 100) -> tuple[list, dict]:
     return trades, stats
 
 
+@app.route("/authorized")
+def authorized_page():
+    rows = _get_authorized_opps()
+    now  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return render_template_string(AUTHORIZED_TEMPLATE, rows=rows, now=now,
+                                  page_title="Authorized Opportunities",
+                                  active_tab="authorized")
+
+
 @app.route("/trades")
 def trades_page():
     trades, stats = _get_trades()
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    return render_template_string(TRADES_TEMPLATE, trades=trades, stats=stats, now=now)
+    return render_template_string(TRADES_TEMPLATE, trades=trades, stats=stats, now=now,
+                                  page_title="Trades", active_tab="trades")
 
 
 if __name__ == "__main__":
