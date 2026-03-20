@@ -442,7 +442,7 @@ def _multi_outcome_result(
     return {
         "ticker":          event_ticker,
         "event_ticker":    event_ticker,
-        "title":           f"[{n}-way] {event_ticker}",
+        "title":           f"[{n}-way] {markets[0].get('title', event_ticker)}",
         "outcomes":        outcomes,
         "ask_prices":      ask_prices,
         "ask_sizes":       ask_sizes,
