@@ -37,6 +37,7 @@ from config import (
     FILL_TIMEOUT_SECS,
     MAX_CONTRACTS_PER_TRADE,
     MAX_LEG_DRIFT,
+    MAX_TRADE_COST,
     MIN_NET_PROFIT,
     TAKER_FEE_COEFF,
     TRADE_POLL_INTERVAL,
@@ -179,8 +180,10 @@ def _preflight(opp: dict) -> tuple[Optional[dict], Optional[str]]:
     # Sort least→most liquid (smallest size first = Phase 1 leg)
     legs.sort(key=lambda l: l["size"])
 
-    # Cap contract count at min(available_size, MAX_CONTRACTS_PER_TRADE)
-    max_count = min(int(min(l["size"] for l in legs)), MAX_CONTRACTS_PER_TRADE)
+    # Cap contract count: min(available_size, MAX_CONTRACTS_PER_TRADE, budget-based cap)
+    # Total cost = curr_sum * count  (each contract costs its ask price)
+    budget_count = int(MAX_TRADE_COST / curr_sum) if curr_sum > 0 else MAX_CONTRACTS_PER_TRADE
+    max_count = min(int(min(l["size"] for l in legs)), MAX_CONTRACTS_PER_TRADE, budget_count)
     if max_count <= 0:
         reason = "zero_contracts_available"
         logger.warning("preflight: %s — abort", reason)

@@ -108,6 +108,11 @@ DEMO_BASE_URL = os.getenv("DEMO_BASE_URL", "https://demo-api.kalshi.co/trade-api
 # Hard cap on contracts per leg per trade
 MAX_CONTRACTS_PER_TRADE = int(os.getenv("MAX_CONTRACTS_PER_TRADE", "50"))
 
+# Maximum total dollar cost per trade (all legs combined).
+# Caps contract count so total spend <= this value.
+# Set to your available balance minus a small buffer.
+MAX_TRADE_COST = float(os.getenv("MAX_TRADE_COST", "100.0"))
+
 # Abort pre-flight if any leg price has drifted more than this from detected price
 MAX_LEG_DRIFT = float(os.getenv("MAX_LEG_DRIFT", "0.02"))
 
