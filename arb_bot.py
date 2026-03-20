@@ -524,6 +524,17 @@ def compute_multi_outcome_opportunity(markets: list, source: str = "REST") -> Op
         return _multi_outcome_result(markets, outcomes, ask_prices, ask_sizes,
                                      sum_asks, "non_exhaustive", source)
 
+    # ── Guard 3: completeness check ──────────────────────────────────────────
+    # Verify we have ALL outcomes for this event before computing profit.
+    # Price-range markets (e.g. Nasdaq yearly range) may have buckets filtered
+    # by volume_24h > 0, making the partial sum appear < 1.0 when the full set
+    # is actually overround.  Result is cached 1h so only the first call per
+    # event hits the API.
+    event_ticker = markets[0].get("event_ticker") or markets[0]["ticker"]
+    if not _event_is_complete(event_ticker, len(markets)):
+        return _multi_outcome_result(markets, outcomes, ask_prices, ask_sizes,
+                                     sum_asks, "non_exhaustive", source)
+
     # ── Real arb / near-miss check ───────────────────────────────────────────
     gross_profit   = 1.0 - sum_asks
     total_fees_val = _total_fees(ask_prices)
@@ -536,15 +547,6 @@ def compute_multi_outcome_opportunity(markets: list, source: str = "REST") -> Op
         category = "near_miss"
     else:
         return None
-
-    # ── Completeness check ───────────────────────────────────────────────────
-    # Verify we have ALL outcomes for this event.  Price-range markets (e.g.
-    # Nasdaq yearly range) may have buckets filtered by volume_24h > 0, making
-    # the partial sum appear < 1.0 when the full set is actually overround.
-    event_ticker = markets[0].get("event_ticker") or markets[0]["ticker"]
-    if not _event_is_complete(event_ticker, len(markets)):
-        return _multi_outcome_result(markets, outcomes, ask_prices, ask_sizes,
-                                     sum_asks, "non_exhaustive", source)
 
     return _multi_outcome_result(markets, outcomes, ask_prices, ask_sizes,
                                  sum_asks, category, source)
