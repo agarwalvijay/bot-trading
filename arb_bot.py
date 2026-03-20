@@ -326,7 +326,7 @@ def compute_opportunity(market: dict, source: str = "REST") -> Optional[dict]:
     ask_sizes  = [yes_ask_size, no_ask_size]
     outcomes   = ["Yes", "No"]
 
-    if any(p < MIN_LEG_PRICE for p in ask_prices):
+    if any(p <= MIN_LEG_PRICE for p in ask_prices):
         return None
 
     sum_asks = sum(ask_prices)
@@ -498,7 +498,7 @@ def compute_multi_outcome_opportunity(markets: list, source: str = "REST") -> Op
             for market in markets
         ]
 
-    if any(p < MIN_LEG_PRICE for p in ask_prices):
+    if any(p <= MIN_LEG_PRICE for p in ask_prices):
         return None
 
     sum_asks = sum(ask_prices)
