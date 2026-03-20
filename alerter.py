@@ -85,7 +85,7 @@ def format_opportunity(opp: dict[str, Any]) -> str:
         "-" * 60,
         f"Sum of asks  : {opp['sum_asks']:.4f}",
         f"Gross profit : {_fmt_pct(opp['gross_profit'])}",
-        f"Total fees   : {_fmt_pct(opp['total_fees'])}  (rate={_fmt_pct(opp['fee_rate'])})",
+        f"Total fees   : {_fmt_pct(opp['total_fees'])}  (rate={_fmt_pct(opp['taker_fee_coeff'])})",
         f"NET PROFIT   : {_fmt_pct(opp['net_profit'])}",
         *extra,
         "=" * 60,
