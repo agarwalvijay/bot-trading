@@ -18,6 +18,11 @@ KALSHI_WS_URL   = os.getenv("KALSHI_WS_URL",   "wss://api.elections.kalshi.com/t
 KALSHI_API_KEY_ID       = os.getenv("KALSHI_API_KEY_ID", "")
 KALSHI_PRIVATE_KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY_PATH", "kalshi_private_key.pem")
 
+# Demo API credentials (separate account at demo.kalshi.co).
+# Fall back to prod credentials if not set — but demo will 401 with prod keys.
+DEMO_API_KEY_ID       = os.getenv("DEMO_API_KEY_ID",       KALSHI_API_KEY_ID)
+DEMO_PRIVATE_KEY_PATH = os.getenv("DEMO_PRIVATE_KEY_PATH", KALSHI_PRIVATE_KEY_PATH)
+
 # ── Scanning behaviour ────────────────────────────────────────────────────────
 # How often (seconds) to re-fetch the full market list
 MARKET_REFRESH_INTERVAL = float(os.getenv("MARKET_REFRESH_INTERVAL", "300"))

@@ -34,8 +34,10 @@ import websocket  # websocket-client
 
 from config import (
     BOOK_BATCH_SIZE,
+    DEMO_API_KEY_ID,
     DEMO_BASE_URL,
     DEMO_MODE,
+    DEMO_PRIVATE_KEY_PATH,
     KALSHI_BASE_URL,
     KALSHI_WS_URL,
     KALSHI_API_KEY_ID,
@@ -51,35 +53,38 @@ logger = logging.getLogger(__name__)
 # RSA-PSS auth (required for order placement — not for market data reads)
 # ---------------------------------------------------------------------------
 
-_private_key = None
+_key_cache: dict[str, object] = {}
 
 
-def _load_private_key():
-    global _private_key
-    if _private_key is not None:
-        return _private_key
+def _load_key(path: str):
+    if path in _key_cache:
+        return _key_cache[path]
     if not _CRYPTO_AVAILABLE:
         return None
     try:
-        with open(KALSHI_PRIVATE_KEY_PATH, "rb") as f:
-            _private_key = serialization.load_pem_private_key(f.read(), password=None)
-        logger.info("Kalshi private key loaded from %s", KALSHI_PRIVATE_KEY_PATH)
-        return _private_key
+        with open(path, "rb") as f:
+            key = serialization.load_pem_private_key(f.read(), password=None)
+        logger.info("Kalshi private key loaded from %s", path)
+        _key_cache[path] = key
+        return key
     except FileNotFoundError:
-        logger.debug("No private key at %s — authenticated endpoints disabled", KALSHI_PRIVATE_KEY_PATH)
+        logger.debug("No private key at %s — authenticated endpoints disabled", path)
         return None
     except Exception as exc:
-        logger.warning("Failed to load Kalshi private key: %s", exc)
+        logger.warning("Failed to load Kalshi private key %s: %s", path, exc)
         return None
 
 
-def _auth_headers(method: str, path: str) -> dict:
+def _auth_headers(method: str, path: str, demo: bool = False) -> dict:
     """
     Return KALSHI-ACCESS-* headers for an authenticated request.
     Signs: {timestamp_ms}{METHOD_UPPER}{path_without_query}
+    Uses demo credentials when demo=True.
     """
-    key = _load_private_key()
-    if not key or not KALSHI_API_KEY_ID:
+    key_path = DEMO_PRIVATE_KEY_PATH if demo else KALSHI_PRIVATE_KEY_PATH
+    key_id   = DEMO_API_KEY_ID       if demo else KALSHI_API_KEY_ID
+    key = _load_key(key_path)
+    if not key or not key_id:
         return {}
     ts = str(int(time.time() * 1000))
     msg = (ts + method.upper() + path).encode("utf-8")
@@ -92,7 +97,7 @@ def _auth_headers(method: str, path: str) -> dict:
         hashes.SHA256(),
     )
     return {
-        "KALSHI-ACCESS-KEY":       KALSHI_API_KEY_ID,
+        "KALSHI-ACCESS-KEY":       key_id,
         "KALSHI-ACCESS-TIMESTAMP": ts,
         "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
     }
@@ -145,7 +150,7 @@ def _trade_sign_path(path: str) -> str:
 def _post(path: str, body: dict) -> Any:
     """Authenticated POST to the trading API (no retry — orders must not be duplicated)."""
     url = f"{_trade_base()}{path}"
-    headers = _auth_headers("POST", _trade_sign_path(path))
+    headers = _auth_headers("POST", _trade_sign_path(path), demo=DEMO_MODE)
     headers["Content-Type"] = "application/json"
     resp = SESSION.post(url, json=body, headers=headers, timeout=15)
     resp.raise_for_status()
@@ -155,7 +160,7 @@ def _post(path: str, body: dict) -> Any:
 def _delete(path: str) -> Any:
     """Authenticated DELETE to the trading API."""
     url = f"{_trade_base()}{path}"
-    headers = _auth_headers("DELETE", _trade_sign_path(path))
+    headers = _auth_headers("DELETE", _trade_sign_path(path), demo=DEMO_MODE)
     resp = SESSION.delete(url, headers=headers, timeout=15)
     resp.raise_for_status()
     return resp.json()
@@ -202,7 +207,7 @@ def get_order(order_id: str) -> dict:
     """Fetch the current state of an order by its Kalshi order ID."""
     path = f"/portfolio/orders/{order_id}"
     url = f"{_trade_base()}{path}"
-    headers = _auth_headers("GET", _trade_sign_path(path))
+    headers = _auth_headers("GET", _trade_sign_path(path), demo=DEMO_MODE)
     resp = SESSION.get(url, headers=headers, timeout=10)
     resp.raise_for_status()
     data = resp.json()
