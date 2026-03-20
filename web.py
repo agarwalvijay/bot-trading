@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 
 from flask import Flask, render_template_string, request, redirect, url_for, jsonify
 
-from config import DB_PATH, TAKER_FEE_COEFF
+from config import DB_PATH, TAKER_FEE_COEFF, TRADING_ENABLED
 from fetcher import fetch_market_prices
 
 app = Flask(__name__)
@@ -40,6 +40,7 @@ TEMPLATE = """<!doctype html>
     td.legs      { font-size: 0.78rem; line-height: 1.6; white-space: nowrap; }
     .q           { max-width: 380px; word-break: break-word; }
     .stat-card   { min-width: 130px; }
+    tr.authorized-row { background: #f0fff4 !important; }
   </style>
 </head>
 <body>
@@ -158,7 +159,7 @@ TEMPLATE = """<!doctype html>
         </thead>
         <tbody>
           {% for r in rows %}
-          <tr>
+          <tr class="{{ 'authorized-row' if r.authorized }}">
             <td class="text-muted text-nowrap">{{ r.time_ago }}</td>
             <td class="q">
               <a href="{{ r.kalshi_url }}" target="_blank" rel="noopener"
@@ -181,6 +182,10 @@ TEMPLATE = """<!doctype html>
                 <br><span class="badge bg-primary">SPREAD</span>
               {% elif r.category == 'ignored' %}
                 <br><span class="badge bg-secondary">IGNORED</span>
+              {% endif %}
+              {% if r.authorized %}
+                <br><span class="badge bg-success">&#9889; AUTHORIZED</span>
+                {% if r.trade_id %}<span class="badge bg-dark ms-1">trade #{{ r.trade_id }}</span>{% endif %}
               {% endif %}
             </td>
             <td class="legs">
@@ -207,6 +212,23 @@ TEMPLATE = """<!doctype html>
             <td class="text-nowrap">
               <button class="btn btn-sm btn-link text-primary p-0 me-1" title="Live prices"
                       onclick="showLive({{ r.row_id }})">&#8635;</button>
+              {% if r.category == 'opportunity' and trading_enabled %}
+                {% if r.authorized %}
+                <form method="post" action="/authorize/{{ r.row_id }}" style="margin:0;display:inline">
+                  <input type="hidden" name="cat" value="{{ category }}">
+                  <input type="hidden" name="authorize" value="0">
+                  <button type="submit" class="btn btn-sm btn-link text-success p-0 me-1"
+                          title="Deauthorize trade" style="font-size:1rem">&#9889;</button>
+                </form>
+                {% else %}
+                <form method="post" action="/authorize/{{ r.row_id }}" style="margin:0;display:inline">
+                  <input type="hidden" name="cat" value="{{ category }}">
+                  <input type="hidden" name="authorize" value="1">
+                  <button type="submit" class="btn btn-sm btn-link text-muted p-0 me-1"
+                          title="Authorize for trading" style="font-size:1rem">&#9889;</button>
+                </form>
+                {% endif %}
+              {% endif %}
               {% if r.category != 'opportunity' %}
               <form method="post" action="/set-category/{{ r.row_id }}" style="margin:0;display:inline">
                 <input type="hidden" name="cat" value="{{ category }}">
@@ -476,6 +498,8 @@ def _get_rows(category=None, limit: int = 200) -> list:
             "category":      r["category"],
             "has_zero_size": r["has_zero_size"],
             "closes_in":     _closes_in(r["close_time"]),
+            "authorized":    bool(r["authorized"]) if "authorized" in r.keys() else False,
+            "trade_id":      r["trade_id"] if "trade_id" in r.keys() else None,
         })
     return rows
 
@@ -513,7 +537,8 @@ def index():
     stats = _get_stats()
     now   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     return render_template_string(TEMPLATE, rows=rows, stats=stats,
-                                  category=cat, now=now)
+                                  category=cat, now=now,
+                                  trading_enabled=TRADING_ENABLED)
 
 
 @app.route("/clear", methods=["POST"])
@@ -555,6 +580,21 @@ def delete_row(row_id: int):
     try:
         con = sqlite3.connect(DB_PATH)
         con.execute("DELETE FROM opportunities WHERE id = ?", (row_id,))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+    return redirect(url_for("index", cat=cat) if cat else url_for("index"))
+
+
+@app.route("/authorize/<int:row_id>", methods=["POST"])
+def authorize_row(row_id: int):
+    cat       = request.form.get("cat", "")
+    authorize = request.form.get("authorize", "1") == "1"
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute("UPDATE opportunities SET authorized = ? WHERE id = ? AND category = 'opportunity'",
+                    (1 if authorize else 0, row_id))
         con.commit()
         con.close()
     except Exception:

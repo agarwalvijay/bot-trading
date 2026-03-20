@@ -33,6 +33,8 @@ import websocket  # websocket-client
 
 from config import (
     BOOK_BATCH_SIZE,
+    DEMO_BASE_URL,
+    DEMO_MODE,
     KALSHI_BASE_URL,
     KALSHI_WS_URL,
     KALSHI_API_KEY_ID,
@@ -122,6 +124,83 @@ def _get(path: str, params: Optional[dict] = None, auth: bool = False, retries: 
             logger.warning("Request error on GET %s: %s (attempt %d)", path, exc, attempt + 1)
             time.sleep(2 ** attempt)
     raise RuntimeError(f"Failed to GET {path} after {retries} attempts")
+
+
+def _trade_base() -> str:
+    """Return the API base URL for order placement (demo or live)."""
+    return DEMO_BASE_URL if DEMO_MODE else KALSHI_BASE_URL
+
+
+def _post(path: str, body: dict) -> Any:
+    """Authenticated POST to the trading API (no retry — orders must not be duplicated)."""
+    url = f"{_trade_base()}{path}"
+    headers = _auth_headers("POST", path)
+    headers["Content-Type"] = "application/json"
+    resp = SESSION.post(url, json=body, headers=headers, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _delete(path: str) -> Any:
+    """Authenticated DELETE to the trading API."""
+    url = f"{_trade_base()}{path}"
+    headers = _auth_headers("DELETE", path)
+    resp = SESSION.delete(url, headers=headers, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def place_order(ticker: str, action: str, side: str, count: int,
+                price: Optional[float], order_type: str = "limit",
+                client_order_id: Optional[str] = None) -> dict:
+    """
+    Place a limit or market order on Kalshi.
+
+    ticker          – market ticker
+    action          – "buy" or "sell"
+    side            – "yes" or "no"
+    count           – number of contracts
+    price           – float 0-1 (e.g. 0.34); converted to cents internally.
+                      Pass None for market orders.
+    order_type      – "limit" or "market"
+    client_order_id – unique string for idempotency (UUID recommended)
+
+    Returns the 'order' dict from the Kalshi response.
+    """
+    body: dict = {
+        "ticker":    ticker,
+        "action":    action,
+        "side":      side,
+        "count":     count,
+        "type":      order_type,
+    }
+    if client_order_id:
+        body["client_order_id"] = client_order_id
+    if order_type == "limit" and price is not None:
+        price_cents = round(price * 100)
+        if side == "yes":
+            body["yes_price"] = price_cents
+        else:
+            body["no_price"] = price_cents
+
+    data = _post("/portfolio/orders", body)
+    return data.get("order", data)
+
+
+def get_order(order_id: str) -> dict:
+    """Fetch the current state of an order by its Kalshi order ID."""
+    url = f"{_trade_base()}/portfolio/orders/{order_id}"
+    headers = _auth_headers("GET", f"/portfolio/orders/{order_id}")
+    resp = SESSION.get(url, headers=headers, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("order", data)
+
+
+def cancel_order(order_id: str) -> dict:
+    """Cancel an open order. Returns the cancelled order dict."""
+    data = _delete(f"/portfolio/orders/{order_id}")
+    return data.get("order", data)
 
 
 def _parse_price(val) -> Optional[float]:

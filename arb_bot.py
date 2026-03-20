@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Optional
 
 from alerter import alert, alert_near_miss, alert_expiring_actionable
 from config import (
@@ -47,6 +47,7 @@ from config import (
     MIN_NET_PROFIT,
     NEAR_MISS_LOWER,
     REST_POLL_INTERVAL,
+    TRADING_ENABLED,
     WS_ALERT_COOLDOWN_SECS,
     WS_FRESHNESS_SECS,
     WS_MIN_PROFIT_IMPROVEMENT,
@@ -55,6 +56,7 @@ from db import (
     init_db, opportunity_count, save_opportunity, update_opportunity,
     load_markets_from_cache, save_markets_cache, markets_cache_count,
 )
+from trader import trading_loop
 from fetcher import (
     KalshiWSClient,
     fetch_active_markets,
@@ -589,29 +591,6 @@ def scan_all_markets(source: str = "REST") -> list[dict]:
             opps.append(opp)
     return opps
 
-
-# ---------------------------------------------------------------------------
-# Phase 2 stub — order execution
-# ---------------------------------------------------------------------------
-
-def execute_arb(opp: dict[str, Any]) -> None:
-    """
-    PHASE 2 STUB
-    ────────────
-    Wire actual order placement here.
-
-    Steps:
-      1. Load KALSHI_API_KEY_ID + KALSHI_PRIVATE_KEY_PATH from config
-      2. For each (ticker, ask_price, side) in opp:
-             POST /portfolio/orders  {ticker, action="buy", side, count, price, type="limit"}
-      3. Handle fills, rejections, position tracking
-      4. Emit fill event back to alerter
-    """
-    logger.info(
-        "[PHASE 2 STUB] Would execute arb on %s (net profit %.3f%%)",
-        opp["ticker"],
-        opp["net_profit"] * 100,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1290,12 +1269,25 @@ def main() -> None:
     refresh_thread.start()
     threads.append(refresh_thread)
 
+    if TRADING_ENABLED:
+        trade_thread = threading.Thread(
+            target=trading_loop,
+            args=(stop_event,),
+            daemon=True,
+            name="trading-loop",
+        )
+        trade_thread.start()
+        threads.append(trade_thread)
+    else:
+        logger.info("Trading disabled (TRADING_ENABLED=false) — set true in .env to enable")
+
     logger.info(
         "Bot running. Press Ctrl+C to stop. "
-        "WebSocket=%s  TakerFeeCoeff=%.4f  MinProfit=%.2f%%",
+        "WebSocket=%s  TakerFeeCoeff=%.4f  MinProfit=%.2f%%  Trading=%s",
         not args.no_ws,
         TAKER_FEE_COEFF,
         MIN_NET_PROFIT * 100,
+        TRADING_ENABLED,
     )
 
     stop_event.wait()

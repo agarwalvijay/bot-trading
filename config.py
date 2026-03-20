@@ -89,6 +89,39 @@ EXPIRING_ACTIONABLE_MIN_PROFIT = float(os.getenv("EXPIRING_ACTIONABLE_MIN_PROFIT
 # ── Database ──────────────────────────────────────────────────────────────────
 DB_PATH = os.getenv("DB_PATH", "arb_opportunities.db")
 
+# ── Trading execution ─────────────────────────────────────────────────────────
+# Master switch — set true only when ready to place real/demo orders.
+TRADING_ENABLED = os.getenv("TRADING_ENABLED", "false").lower() == "true"
+
+# When true, orders go to demo-api.kalshi.co (paper money, no real risk).
+# Always start here. Switch to false only after demo validation.
+DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
+
+# Demo API base URL (only used for order placement when DEMO_MODE=true)
+DEMO_BASE_URL = os.getenv("DEMO_BASE_URL", "https://demo-api.kalshi.co/trade-api/v2")
+
+# Hard cap on contracts per leg per trade
+MAX_CONTRACTS_PER_TRADE = int(os.getenv("MAX_CONTRACTS_PER_TRADE", "50"))
+
+# Abort pre-flight if any leg price has drifted more than this from detected price
+MAX_LEG_DRIFT = float(os.getenv("MAX_LEG_DRIFT", "0.02"))
+
+# Seconds to wait for a fill confirmation before declaring timeout
+FILL_TIMEOUT_SECS = int(os.getenv("FILL_TIMEOUT_SECS", "10"))
+
+# Seconds to pause before retrying leg B after Phase 2 failure
+UNWIND_RETRY_DELAY_SECS = int(os.getenv("UNWIND_RETRY_DELAY_SECS", "5"))
+
+# Seconds to wait for limit-sell unwind before escalating to market order
+UNWIND_LIMIT_TIMEOUT_SECS = int(os.getenv("UNWIND_LIMIT_TIMEOUT_SECS", "60"))
+
+# If true, hold an unwindable leg A position as a deliberate directional bet.
+# Requires explicit opt-in — default false.
+ALLOW_DIRECTIONAL_HOLD = os.getenv("ALLOW_DIRECTIONAL_HOLD", "false").lower() == "true"
+
+# How often (seconds) the trading loop checks for newly authorized opportunities
+TRADE_POLL_INTERVAL = int(os.getenv("TRADE_POLL_INTERVAL", "5"))
+
 # ── Alerting ──────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
