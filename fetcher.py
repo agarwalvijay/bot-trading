@@ -223,6 +223,39 @@ def cancel_order(order_id: str) -> dict:
     return data.get("order", data)
 
 
+def get_order_fills(order_id: str) -> Optional[dict]:
+    """
+    Look up a completed order via GET /portfolio/fills?order_id=...
+
+    Kalshi removes filled orders from GET /portfolio/orders/{id} (returns 404).
+    This endpoint returns the fill record so we can confirm fill price and count.
+    Returns a synthetic order-like dict, or None if not found.
+    """
+    path = "/portfolio/fills"
+    url  = f"{_trade_base()}{path}"
+    headers = _auth_headers("GET", _trade_sign_path(path), demo=DEMO_MODE)
+    try:
+        resp = SESSION.get(url, params={"order_id": order_id}, headers=headers, timeout=10)
+        if not resp.ok:
+            return None
+        fills = resp.json().get("fills", [])
+        if not fills:
+            return None
+        # Aggregate fills for this order
+        total_count = sum(int(f.get("count", 0)) for f in fills)
+        avg_price   = sum(float(f.get("yes_price", 0)) * int(f.get("count", 0))
+                         for f in fills) / total_count if total_count else 0
+        return {
+            "order_id":    order_id,
+            "status":      "filled",
+            "filled_count": total_count,
+            "yes_price":   avg_price,
+        }
+    except Exception as exc:
+        logger.warning("get_order_fills(%s) failed: %s", order_id, exc)
+        return None
+
+
 def _parse_price(val) -> Optional[float]:
     """Parse a Kalshi price field (string or numeric) to float, or None."""
     try:

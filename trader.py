@@ -52,7 +52,7 @@ from db import (
     mark_likely_resolved,
     update_trade,
 )
-from fetcher import cancel_order, fetch_market_prices, get_order, place_order
+from fetcher import cancel_order, fetch_market_prices, get_order, get_order_fills, place_order
 
 logger = logging.getLogger(__name__)
 
@@ -68,8 +68,9 @@ def _wait_for_fill(order_id: str, timeout_secs: float) -> Optional[dict]:
     """
     Poll GET /portfolio/orders/{order_id} until fully filled or timeout.
 
-    On timeout: attempts to cancel the order, then returns any partial fill
-    (or None if nothing filled).
+    On timeout: attempts to cancel the order, then returns any partial fill.
+    404 on get_order means Kalshi already processed the order (filled or
+    auto-cancelled) — fall through to fill lookup immediately.
     """
     deadline = time.time() + timeout_secs
     while time.time() < deadline:
@@ -82,6 +83,10 @@ def _wait_for_fill(order_id: str, timeout_secs: float) -> Optional[dict]:
                 fc = order.get("filled_count", 0)
                 return order if fc > 0 else None
         except Exception as exc:
+            if "404" in str(exc):
+                # Order gone from active list — already filled or auto-cancelled
+                logger.info("get_order(%s) 404 — checking fills", order_id)
+                return get_order_fills(order_id)
             logger.warning("get_order(%s) error: %s", order_id, exc)
         time.sleep(0.5)
 
@@ -91,6 +96,10 @@ def _wait_for_fill(order_id: str, timeout_secs: float) -> Optional[dict]:
         order = cancel_order(order_id)
         return order if order.get("filled_count", 0) > 0 else None
     except Exception as exc:
+        if "404" in str(exc):
+            # Cancel 404 = order already processed; check fills
+            logger.info("cancel_order(%s) 404 — checking fills", order_id)
+            return get_order_fills(order_id)
         logger.error("cancel_order(%s) failed: %s", order_id, exc)
         return None
 
