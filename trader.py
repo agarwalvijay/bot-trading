@@ -97,10 +97,11 @@ def _wait_for_fill(order_id: str, timeout_secs: float) -> Optional[dict]:
 # Pre-flight price check
 # ---------------------------------------------------------------------------
 
-def _preflight(opp: dict) -> Optional[dict]:
+def _preflight(opp: dict) -> tuple[Optional[dict], Optional[str]]:
     """
-    Re-fetch current prices for all legs.  Returns a dict of verified leg
-    data (sorted least→most liquid) or None if the trade should be aborted.
+    Re-fetch current prices for all legs.
+
+    Returns (result_dict, None) on success, or (None, reason_str) on abort.
 
     Aborts if:
       - Any leg price has drifted > MAX_LEG_DRIFT from detected price
@@ -113,8 +114,9 @@ def _preflight(opp: dict) -> Optional[dict]:
         logged_prices   = json.loads(opp.get("ask_prices")      or "[]")
         logged_sizes    = json.loads(opp.get("ask_sizes")        or "[]")
     except Exception as exc:
-        logger.error("preflight: failed to parse opp fields: %s", exc)
-        return None
+        reason = f"parse_error: {exc}"
+        logger.error("preflight: %s", reason)
+        return None, reason
 
     # For binary markets the single ticker IS the event ticker
     if not outcome_tickers:
@@ -122,8 +124,9 @@ def _preflight(opp: dict) -> Optional[dict]:
 
     current = fetch_market_prices(outcome_tickers)
     if not current:
-        logger.warning("preflight: fetch_market_prices returned nothing")
-        return None
+        reason = "price_fetch_returned_nothing"
+        logger.warning("preflight: %s — abort", reason)
+        return None, reason
 
     legs = []
     for i, ticker in enumerate(outcome_tickers):
@@ -133,15 +136,15 @@ def _preflight(opp: dict) -> Optional[dict]:
         logged_p   = logged_prices[i] if i < len(logged_prices) else None
 
         if curr_price is None:
-            logger.warning("preflight: no current ask for %s — abort", ticker)
-            return None
+            reason = f"no_ask_price: {ticker}"
+            logger.warning("preflight: %s — abort", reason)
+            return None, reason
 
         if logged_p is not None and abs(curr_price - logged_p) > MAX_LEG_DRIFT:
-            logger.warning(
-                "preflight: %s price drifted %.4f → %.4f (drift=%.4f > max=%.4f) — abort",
-                ticker, logged_p, curr_price, abs(curr_price - logged_p), MAX_LEG_DRIFT,
-            )
-            return None
+            drift = abs(curr_price - logged_p)
+            reason = f"price_drift: {ticker} {logged_p:.4f}→{curr_price:.4f} drift={drift:.4f}"
+            logger.warning("preflight: %s (max={MAX_LEG_DRIFT}) — abort", reason)
+            return None, reason
 
         legs.append({
             "ticker":       ticker,
@@ -157,15 +160,14 @@ def _preflight(opp: dict) -> Optional[dict]:
     net_profit = gross - fees
 
     if curr_sum >= 1.0:
-        logger.info("preflight: sum=%.4f >= 1.0 — no arb, abort", curr_sum)
-        return None
+        reason = f"sum_ge_1: sum={curr_sum:.4f}"
+        logger.info("preflight: %s — no arb, abort", reason)
+        return None, reason
 
     if net_profit < MIN_NET_PROFIT:
-        logger.info(
-            "preflight: net_profit=%.4f%% < min=%.4f%% — abort",
-            net_profit * 100, MIN_NET_PROFIT * 100,
-        )
-        return None
+        reason = f"net_profit_too_low: {net_profit*100:.3f}% < min={MIN_NET_PROFIT*100:.3f}%"
+        logger.info("preflight: %s — abort", reason)
+        return None, reason
 
     # Sort least→most liquid (smallest size first = Phase 1 leg)
     legs.sort(key=lambda l: l["size"])
@@ -173,15 +175,16 @@ def _preflight(opp: dict) -> Optional[dict]:
     # Cap contract count at min(available_size, MAX_CONTRACTS_PER_TRADE)
     max_count = min(int(min(l["size"] for l in legs)), MAX_CONTRACTS_PER_TRADE)
     if max_count <= 0:
-        logger.warning("preflight: no contracts available — abort")
-        return None
+        reason = "zero_contracts_available"
+        logger.warning("preflight: %s — abort", reason)
+        return None, reason
 
     logger.info(
         "preflight OK: sum=%.4f  net=+%.2f%%  contracts=%d  legs=%s",
         curr_sum, net_profit * 100, max_count,
         [(l["ticker"], l["price"]) for l in legs],
     )
-    return {"legs": legs, "count": max_count, "net_profit": net_profit, "sum": curr_sum}
+    return {"legs": legs, "count": max_count, "net_profit": net_profit, "sum": curr_sum}, None
 
 
 # ---------------------------------------------------------------------------
@@ -297,12 +300,12 @@ def execute_trade(opp: dict) -> None:
     logger.info("=== TRADE START [%s] opp_id=%d  %s ===", mode, opp_id, opp.get("title", ""))
 
     # ── Pre-flight ───────────────────────────────────────────────────────────
-    verified = _preflight(opp)
+    verified, abort_reason = _preflight(opp)
     if verified is None:
-        logger.info("Trade aborted at pre-flight (opp_id=%d)", opp_id)
-        # Create a minimal trade record so we don't retry this immediately
+        logger.info("Trade aborted at pre-flight (opp_id=%d): %s", opp_id, abort_reason)
         trade_id = create_trade(opp_id, [], [], [], [], DEMO_MODE)
         update_trade(trade_id, status="preflight_failed",
+                     notes=abort_reason,
                      completed_at=datetime.now(timezone.utc).isoformat())
         return
 
