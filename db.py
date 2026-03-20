@@ -106,9 +106,10 @@ def init_db() -> None:
             ON opportunities (category)
         """)
         # Migration: add columns that may be absent in existing databases
-        _add_column_if_missing(con, "opportunities", "event_ticker",    "TEXT NOT NULL DEFAULT ''")
-        _add_column_if_missing(con, "opportunities", "close_time",      "TEXT")
-        _add_column_if_missing(con, "opportunities", "taker_fee_coeff", "REAL NOT NULL DEFAULT 0.07")
+        _add_column_if_missing(con, "opportunities", "event_ticker",     "TEXT NOT NULL DEFAULT ''")
+        _add_column_if_missing(con, "opportunities", "close_time",       "TEXT")
+        _add_column_if_missing(con, "opportunities", "taker_fee_coeff",  "REAL NOT NULL DEFAULT 0.07")
+        _add_column_if_missing(con, "opportunities", "outcome_tickers",  "TEXT NOT NULL DEFAULT '[]'")
 
 
 def _add_column_if_missing(con: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -124,8 +125,9 @@ def save_opportunity(opp: dict[str, Any]) -> int:
             INSERT INTO opportunities
                 (detected_at, ticker, event_ticker, title, outcomes,
                  ask_prices, ask_sizes, sum_asks, gross_profit, total_fees,
-                 net_profit, taker_fee_coeff, source, category, has_zero_size, close_time)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 net_profit, taker_fee_coeff, source, category, has_zero_size,
+                 close_time, outcome_tickers)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             datetime.now(timezone.utc).isoformat(),
             opp["ticker"],
@@ -143,6 +145,7 @@ def save_opportunity(opp: dict[str, Any]) -> int:
             opp.get("category", "opportunity"),
             1 if opp.get("has_zero_size") else 0,
             opp.get("close_time"),
+            json.dumps(opp.get("outcome_tickers", [])),
         ))
         return cur.lastrowid
 

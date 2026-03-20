@@ -509,33 +509,41 @@ def api_prices(row_id: int):
             con.close()
             return jsonify({"error": "Row not found"}), 404
 
-        event_ticker  = row["event_ticker"] or row["ticker"]
-        logged_prices = json.loads(row["ask_prices"] or "[]")
-        outcomes      = json.loads(row["outcomes"]   or "[]")
-        close_time    = row["close_time"]
-
-        # Look up individual tickers for this event in the markets cache
-        if row["event_ticker"]:
-            cache_rows = con.execute(
-                "SELECT ticker, title, close_time FROM markets_cache WHERE event_ticker = ?",
-                (event_ticker,),
-            ).fetchall()
-        else:
-            cache_rows = con.execute(
-                "SELECT ticker, title, close_time FROM markets_cache WHERE ticker = ?",
-                (event_ticker,),
-            ).fetchall()
+        event_ticker     = row["event_ticker"] or row["ticker"]
+        logged_prices    = json.loads(row["ask_prices"]      or "[]")
+        outcomes         = json.loads(row["outcomes"]        or "[]")
+        outcome_tickers  = json.loads(row["outcome_tickers"] or "[]")
+        close_time       = row["close_time"]
 
         # Fall back to close_time from cache if not stored on the opportunity
-        if not close_time and cache_rows:
-            close_time = cache_rows[0]["close_time"]
+        if not close_time:
+            ct_row = con.execute(
+                "SELECT close_time FROM markets_cache WHERE event_ticker = ? LIMIT 1",
+                (event_ticker,),
+            ).fetchone()
+            if ct_row:
+                close_time = ct_row["close_time"]
 
         con.close()
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
-    # Fetch current prices from Kalshi API
-    tickers = [r["ticker"] for r in cache_rows]
+    # Use stored outcome_tickers when available; fall back to cache lookup by event
+    if outcome_tickers:
+        tickers = outcome_tickers
+    else:
+        try:
+            con2 = sqlite3.connect(DB_PATH)
+            con2.row_factory = sqlite3.Row
+            cache_rows = con2.execute(
+                "SELECT ticker FROM markets_cache WHERE event_ticker = ? OR ticker = ?",
+                (event_ticker, event_ticker),
+            ).fetchall()
+            con2.close()
+            tickers = [r["ticker"] for r in cache_rows]
+        except Exception:
+            tickers = []
+
     if not tickers:
         return jsonify({"error": "Tickers not found in cache — run a market refresh first"}), 404
 
@@ -544,17 +552,14 @@ def api_prices(row_id: int):
     except Exception as exc:
         return jsonify({"error": f"Kalshi API error: {exc}"}), 502
 
-    # Match current prices to outcomes by title (outcomes stored as title[:60])
-    title_to_row = {r["title"][:60]: r for r in cache_rows}
-
     legs = []
     for i, outcome in enumerate(outcomes):
-        cache_row   = title_to_row.get(outcome)
-        ticker      = cache_row["ticker"] if cache_row else None
-        logged_p    = logged_prices[i] if i < len(logged_prices) else None
-        curr_entry  = current.get(ticker, {}) if ticker else {}
-        curr_price  = curr_entry.get("yes_ask")
-        curr_size   = curr_entry.get("yes_ask_size")
+        # Use stored ticker for this position; fall back to event ticker itself
+        ticker     = outcome_tickers[i] if i < len(outcome_tickers) else event_ticker
+        logged_p   = logged_prices[i] if i < len(logged_prices) else None
+        curr_entry = current.get(ticker, {})
+        curr_price = curr_entry.get("yes_ask")
+        curr_size  = curr_entry.get("yes_ask_size")
         legs.append({
             "outcome":       outcome,
             "logged_price":  logged_p,

@@ -440,10 +440,11 @@ def _multi_outcome_result(
     total_fees_val = _total_fees(ask_prices)
     net_profit     = gross_profit - total_fees_val if category not in ("cumulative", "non_exhaustive") else 0.0
     return {
-        "ticker":          event_ticker,
-        "event_ticker":    event_ticker,
-        "title":           f"[{n}-way] {markets[0].get('title', event_ticker)}",
-        "outcomes":        outcomes,
+        "ticker":           event_ticker,
+        "event_ticker":     event_ticker,
+        "title":            f"[{n}-way] {markets[0].get('title', event_ticker)}",
+        "outcomes":         outcomes,
+        "outcome_tickers":  [m["ticker"] for m in markets],
         "ask_prices":      ask_prices,
         "ask_sizes":       ask_sizes,
         "sum_asks":        sum_asks,
@@ -488,6 +489,14 @@ def compute_multi_outcome_opportunity(markets: list, source: str = "REST") -> Op
             ask_prices.append(yes_ask)
             ask_sizes.append(entry.get("yes_ask_size", 0.0))
             outcomes.append(market.get("title", t)[:60])
+
+    # Deduplicate outcome labels when multiple markets share the same title
+    # (e.g. game markets where both legs say "UMBC at Ohio Winner?")
+    if len(set(outcomes)) < len(outcomes):
+        outcomes = [
+            f"{market.get('title', market['ticker'])[:45]} ({market['ticker'].split('-')[-1]})"
+            for market in markets
+        ]
 
     if any(p < MIN_LEG_PRICE for p in ask_prices):
         return None
