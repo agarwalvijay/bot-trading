@@ -189,8 +189,12 @@ TEMPLATE = """<!doctype html>
                 <br><span class="badge bg-secondary">IGNORED</span>
               {% endif %}
               {% if r.authorized %}
-                <br><span class="badge bg-success">&#9889; AUTHORIZED</span>
-                {% if r.trade_id %}<span class="badge bg-dark ms-1">trade #{{ r.trade_id }}</span>{% endif %}
+                {% if r.trade_id %}
+                  <br><span class="badge bg-success">&#9889; AUTHORIZED</span>
+                  <span class="badge bg-dark ms-1">trade #{{ r.trade_id }}</span>
+                {% else %}
+                  <br><span class="badge bg-success">&#9889; AUTHORIZED — attempting…</span>
+                {% endif %}
               {% endif %}
             </td>
             <td class="legs">
@@ -898,7 +902,7 @@ def _get_trades(limit: int = 100) -> tuple[list, dict]:
 
     in_progress_statuses = {"phase1_placed", "phase1_filled", "phase2_placed", "unwind_retry"}
     unwind_statuses      = {"unwind_limit", "unwind_market", "unwind_hold", "unwind_failed"}
-    failed_statuses      = {"preflight_failed", "aborted"}
+    failed_statuses      = {"aborted"}
 
     for r in raw:
         status = r["status"] or ""

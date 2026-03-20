@@ -302,11 +302,10 @@ def execute_trade(opp: dict) -> None:
     # ── Pre-flight ───────────────────────────────────────────────────────────
     verified, abort_reason = _preflight(opp)
     if verified is None:
-        logger.info("Trade aborted at pre-flight (opp_id=%d): %s", opp_id, abort_reason)
-        trade_id = create_trade(opp_id, [], [], [], [], DEMO_MODE)
-        update_trade(trade_id, status="preflight_failed",
-                     notes=abort_reason,
-                     completed_at=datetime.now(timezone.utc).isoformat())
+        # Do NOT create a trade record — leave trade_id null so the loop
+        # retries on the next tick.  Preflight failures are transient (price
+        # drift, spread temporarily closed); the opportunity stays authorized.
+        logger.info("Preflight failed (opp_id=%d): %s — will retry", opp_id, abort_reason)
         return
 
     legs      = verified["legs"]
