@@ -438,7 +438,7 @@ def compute_opportunity(market: dict, source: str = "REST") -> Optional[dict]:
 
     if net_profit >= MIN_NET_PROFIT and all(s >= MIN_LEG_SIZE for s in ask_sizes):
         category = "opportunity"
-    elif gross_profit > 0 and NEAR_MISS_LOWER <= net_profit < 0:
+    elif gross_profit > 0 and NEAR_MISS_LOWER <= net_profit < MIN_NET_PROFIT:
         category = "near_miss"
     else:
         return None
@@ -697,7 +697,7 @@ def compute_multi_outcome_opportunity(markets: list, source: str = "REST") -> Op
 
     if net_profit >= MIN_NET_PROFIT and all(s >= MIN_LEG_SIZE for s in ask_sizes):
         category = "opportunity"
-    elif gross_profit > 0 and NEAR_MISS_LOWER <= net_profit < 0:
+    elif gross_profit > 0 and NEAR_MISS_LOWER <= net_profit < MIN_NET_PROFIT:
         category = "near_miss"
     else:
         return None
