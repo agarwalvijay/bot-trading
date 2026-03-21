@@ -162,8 +162,9 @@ def init_db() -> None:
         _add_column_if_missing(con, "opportunities", "authorized",       "INTEGER NOT NULL DEFAULT 0")
         _add_column_if_missing(con, "opportunities", "trade_id",         "INTEGER")
         _add_column_if_missing(con, "opportunities", "volume_24h",       "REAL NOT NULL DEFAULT 0")
-        _add_column_if_missing(con, "opportunities", "event_slug",       "TEXT NOT NULL DEFAULT ''")
-        _add_column_if_missing(con, "markets_cache", "subtitle",         "TEXT NOT NULL DEFAULT ''")
+        _add_column_if_missing(con, "opportunities", "event_slug",         "TEXT NOT NULL DEFAULT ''")
+        _add_column_if_missing(con, "opportunities", "trader_invoked_at", "TEXT")
+        _add_column_if_missing(con, "markets_cache", "subtitle",          "TEXT NOT NULL DEFAULT ''")
 
 
 def _add_column_if_missing(con: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -336,6 +337,25 @@ def set_authorized(row_id: int, authorized: bool) -> None:
     with _conn() as con:
         con.execute("UPDATE opportunities SET authorized = ? WHERE id = ?",
                     (1 if authorized else 0, row_id))
+
+
+def stamp_trader_invoked(opp_id: int) -> None:
+    """Record that execute_trade was called for this opportunity (regardless of outcome)."""
+    with _conn() as con:
+        con.execute(
+            "UPDATE opportunities SET trader_invoked_at = ? WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), opp_id),
+        )
+
+
+def has_fresh_detection(ticker: str, since_iso: str) -> bool:
+    """Return True if a newer opportunity row exists for this ticker since the given timestamp."""
+    with _conn() as con:
+        row = con.execute(
+            "SELECT 1 FROM opportunities WHERE ticker = ? AND detected_at > ? LIMIT 1",
+            (ticker, since_iso),
+        ).fetchone()
+    return row is not None
 
 
 def mark_likely_resolved(opp_id: int) -> None:

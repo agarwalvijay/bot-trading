@@ -185,6 +185,7 @@ TEMPLATE = """<!doctype html>
             <th style="width:90px">Net profit</th>
             <th style="width:70px">Vol 24h</th>
             <th style="width:60px">Src</th>
+            <th style="width:90px">Trade</th>
             <th style="width:52px"></th>
           </tr>
         </thead>
@@ -217,12 +218,7 @@ TEMPLATE = """<!doctype html>
                 <br><span class="badge bg-secondary">IGNORED</span>
               {% endif %}
               {% if r.authorized %}
-                {% if r.trade_id %}
-                  <br><span class="badge bg-success">&#9889; AUTHORIZED</span>
-                  <span class="badge bg-dark ms-1">trade #{{ r.trade_id }}</span>
-                {% else %}
-                  <br><span class="badge bg-success">&#9889; AUTHORIZED — attempting…</span>
-                {% endif %}
+                <br><span class="badge bg-success">&#9889; AUTHORIZED</span>
               {% endif %}
             </td>
             <td class="legs">
@@ -248,6 +244,29 @@ TEMPLATE = """<!doctype html>
               <span class="badge {{ 'bg-info text-dark' if r.source == 'WS' else 'bg-secondary' }}">
                 {{ r.source }}
               </span>
+            </td>
+            <td class="text-nowrap">
+              {% if r.trade_id %}
+                {% if r.trade_status == 'complete' %}
+                  <a href="/trades" class="badge bg-success text-decoration-none">&#10003; complete</a>
+                {% elif r.trade_status in ('phase1_placed', 'phase2_placed', 'pending') %}
+                  <a href="/trades" class="badge bg-warning text-dark text-decoration-none">&#8635; in progress</a>
+                {% elif r.trade_status in ('unwind_retry', 'unwind_limit', 'unwind_market', 'unwind_hold') %}
+                  <a href="/trades" class="badge bg-warning text-dark text-decoration-none">&#9100; unwinding</a>
+                {% elif r.trade_status == 'aborted' %}
+                  <a href="/trades" class="badge bg-danger text-decoration-none">&#10007; aborted</a>
+                {% elif r.trade_status == 'preflight_failed' %}
+                  <a href="/trades" class="badge bg-secondary text-decoration-none">preflight fail</a>
+                {% elif r.trade_status %}
+                  <a href="/trades" class="badge bg-secondary text-decoration-none">{{ r.trade_status }}</a>
+                {% else %}
+                  <a href="/trades" class="badge bg-primary text-decoration-none">attempted</a>
+                {% endif %}
+              {% elif r.trader_invoked_at %}
+                <span class="badge bg-secondary" title="Invoked at {{ r.trader_invoked_at }}">preflight fail</span>
+              {% else %}
+                <span class="text-muted">—</span>
+              {% endif %}
             </td>
             <td class="text-nowrap">
               <button class="btn btn-sm btn-link text-primary p-0 me-1" title="Live prices"
@@ -810,12 +829,16 @@ def _get_rows(category=None, limit: int = 200) -> list:
     try:
         con = sqlite3.connect(DB_PATH)
         con.row_factory = sqlite3.Row
-        q = "SELECT * FROM opportunities"
+        q = """
+            SELECT o.*, t.status AS trade_status
+            FROM opportunities o
+            LEFT JOIN trades t ON o.trade_id = t.id
+        """
         params: list = []
         if category:
-            q += " WHERE category = ?"
+            q += " WHERE o.category = ?"
             params.append(category)
-        q += " ORDER BY detected_at DESC LIMIT ?"
+        q += " ORDER BY o.detected_at DESC LIMIT ?"
         params.append(limit)
         raw = con.execute(q, params).fetchall()
         con.close()
@@ -852,9 +875,11 @@ def _get_rows(category=None, limit: int = 200) -> list:
             "category":      r["category"],
             "has_zero_size": r["has_zero_size"],
             "closes_in":     _closes_in(r["close_time"]),
-            "authorized":    bool(r["authorized"]) if "authorized" in r.keys() else False,
-            "trade_id":      r["trade_id"] if "trade_id" in r.keys() else None,
-            "volume_24h":    r["volume_24h"] if "volume_24h" in r.keys() else 0,
+            "authorized":         bool(r["authorized"]) if "authorized" in r.keys() else False,
+            "trade_id":           r["trade_id"] if "trade_id" in r.keys() else None,
+            "trade_status":       r["trade_status"] if "trade_status" in r.keys() else None,
+            "trader_invoked_at":  r["trader_invoked_at"] if "trader_invoked_at" in r.keys() else None,
+            "volume_24h":         r["volume_24h"] if "volume_24h" in r.keys() else 0,
         })
     return rows
 

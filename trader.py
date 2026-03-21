@@ -54,8 +54,10 @@ from db import (
     get_authorized_opportunities,
     get_complete_trades,
     get_trade,
+    has_fresh_detection,
     mark_likely_resolved,
     set_authorized,
+    stamp_trader_invoked,
     update_trade,
 )
 from fetcher import cancel_order, fetch_market_prices, get_order, get_order_fills, place_order
@@ -332,6 +334,7 @@ def execute_trade(opp: dict) -> None:
     opp_id = opp["id"]
     mode   = "DEMO" if DEMO_MODE else "LIVE"
     logger.info("=== TRADE START [%s] opp_id=%d  %s ===", mode, opp_id, opp.get("title", ""))
+    stamp_trader_invoked(opp_id)
 
     # ── Pre-flight ───────────────────────────────────────────────────────────
     verified, abort_reason = _preflight(opp)
@@ -561,13 +564,16 @@ def trading_loop(stop_event: threading.Event,
     mode = "DEMO" if DEMO_MODE else "LIVE"
     logger.info("Trading loop started [%s]", mode)
 
+    # First run is treated as event-driven (handles authorized opps present at startup)
+    triggered = True
+
     while not stop_event.is_set():
         try:
             opps = get_authorized_opportunities()
             if opps:
                 # Drain priority deque — sort triggered opp(s) to front
+                pri: set = set()
                 if priority_ids:
-                    pri = set()
                     while True:
                         try:
                             pri.add(priority_ids.popleft())
@@ -575,11 +581,19 @@ def trading_loop(stop_event: threading.Event,
                             break
                     opps.sort(key=lambda o: 0 if o["id"] in pri else 1)
 
-                logger.info("Trading loop: %d authorized opportunity/ies", len(opps))
+                logger.info("Trading loop: %d authorized opportunity/ies [%s]",
+                            len(opps), "event" if triggered else "poll")
                 # One trade at a time — acquire lock and try each opp in priority order
                 if _trade_lock.acquire(blocking=False):
                     try:
                         for opp in opps:
+                            # Poll-mode: skip opps with no fresh detection since last invocation
+                            if not triggered:
+                                invoked_at = opp.get("trader_invoked_at")
+                                if invoked_at and not has_fresh_detection(opp["ticker"], invoked_at):
+                                    logger.debug("Poll: skipping opp_id=%d (no fresh detection since %s)",
+                                                 opp["id"], invoked_at)
+                                    continue
                             if execute_trade(opp):  # True = trade attempted; stop iterating
                                 break
                     finally:
@@ -590,6 +604,7 @@ def trading_loop(stop_event: threading.Event,
             logger.error("Trading loop error: %s", exc)
 
         # Wait for trigger (immediate wake on new arb) or fallback timeout
+        # Capture result for next iteration: True = event-driven, False = poll timeout
         if trade_trigger is not None:
             triggered = trade_trigger.wait(timeout=TRADE_POLL_INTERVAL)
             trade_trigger.clear()
@@ -597,6 +612,7 @@ def trading_loop(stop_event: threading.Event,
                 logger.debug("Trading loop woken by arb trigger")
         else:
             stop_event.wait(TRADE_POLL_INTERVAL)
+            triggered = False
 
     logger.info("Trading loop stopped")
 
