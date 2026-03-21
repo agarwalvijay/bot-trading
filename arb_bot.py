@@ -38,6 +38,7 @@ from config import (
     TAKER_FEE_COEFF,
     HIGH_PROFIT_THRESHOLD,
     MARKET_REFRESH_INTERVAL,
+    MAX_MARKETS,
     MAX_REST_MARKETS,
     NEAR_TERM_HORIZON_HOURS,
     NEAR_TERM_SCAN_INTERVAL,
@@ -147,11 +148,44 @@ _EVENT_SIZE_CACHE_TTL = 3600.0  # re-verify once per hour
 # per TTL before trusting n == total as "complete".
 _event_size_verified: set = set()
 
+# Background verification queue — events pending API count confirmation.
+# A single worker thread drains this with rate-limiting to avoid 429s.
+_verify_queue: queue.Queue = queue.Queue()
+
+
+def _verification_worker(stop_event: threading.Event) -> None:
+    """
+    Background thread: drains _verify_queue, calls fetch_event_market_count
+    once per event, updates cache.  Rate-limited to 1 call/s to avoid 429s.
+    """
+    seen: set = set()
+    while not stop_event.is_set():
+        try:
+            event_ticker = _verify_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        if event_ticker in seen:
+            continue
+        seen.add(event_ticker)
+        try:
+            total = fetch_event_market_count(event_ticker)
+            if total > 0:
+                now = time.time()
+                existing = _event_size_cache.get(event_ticker)
+                if existing is None or total > existing[0]:
+                    _event_size_cache[event_ticker] = (total, now)
+                _event_size_verified.add(event_ticker)
+                logger.debug("Verified event=%s total=%d", event_ticker, total)
+        except Exception as exc:
+            logger.debug("Verification failed for %s: %s", event_ticker, exc)
+        time.sleep(1.0)  # 1 call/s — well within Kalshi rate limits
+
 
 def _prewarm_event_size_cache(markets: list) -> None:
     """
     Populate _event_size_cache from the full (unfiltered) market list.
     Only raises counts — never lowers an API-verified value.
+    Queues newly-seen or changed events for background verification.
     """
     from collections import Counter
     counts = Counter(m.get("event_ticker") for m in markets if m.get("event_ticker"))
@@ -160,8 +194,8 @@ def _prewarm_event_size_cache(markets: list) -> None:
         existing = _event_size_cache.get(evt)
         if existing is None or cnt > existing[0]:
             _event_size_cache[evt] = (cnt, now_ts)
-            # New or increased count → requires re-verification
             _event_size_verified.discard(evt)
+            _verify_queue.put(evt)  # schedule background API verification
     logger.debug("Event size cache pre-warmed: %d events", len(counts))
 
 
@@ -169,45 +203,31 @@ def _event_is_complete(event_ticker: str, tracked: int) -> bool:
     """
     Return True if `tracked` outcomes == all open outcomes for this event.
 
-    Uses a two-tier approach:
-    1. Prewarm cache from full market listing (fast, may undercount if some
-       markets haven't opened yet, e.g. soccer Draw outcome).
-    2. API verification the first time n == cached_total — catches cases where
-       the prewarm count is too low (Draw not yet open → prewarm shows 2,
-       but API confirms 3).  Result is cached so the API is called at most
-       once per event per TTL hour.
+    Fast path: compares against prewarm cache (no API call).
+    If the event isn't verified yet (prewarm may undercount), conservatively
+    returns False — the background worker will verify and update the cache,
+    after which the next scan will accept or reject correctly.
     """
     now = time.time()
     cached = _event_size_cache.get(event_ticker)
-    if cached and (now - cached[1]) < _EVENT_SIZE_CACHE_TTL:
-        total = cached[0]
-    else:
-        # Cache miss or TTL expired — fetch from API
-        total = fetch_event_market_count(event_ticker)
-        if total > 0:
-            _event_size_cache[event_ticker] = (total, now)
-            _event_size_verified.add(event_ticker)
+    if not cached or (now - cached[1]) >= _EVENT_SIZE_CACHE_TTL:
+        # No data yet — queue for verification and conservatively reject
+        _verify_queue.put(event_ticker)
+        return False
 
-    if total > 0 and total != tracked:
+    total = cached[0]
+
+    if total != tracked:
         logger.debug(
             "Incomplete event %s: tracking %d of %d total outcomes",
             event_ticker, tracked, total,
         )
         return False
 
-    # n == total (looks complete) but prewarm may have undercounted.
-    # Verify via API once per TTL to catch missing outcomes (e.g. Draw not yet open).
+    # n == total but prewarm may have undercounted — wait for background verify
     if event_ticker not in _event_size_verified:
-        api_total = fetch_event_market_count(event_ticker)
-        if api_total > 0:
-            _event_size_cache[event_ticker] = (api_total, now)
-            _event_size_verified.add(event_ticker)
-            if api_total != tracked:
-                logger.debug(
-                    "API-verified incomplete: event=%s has %d markets, tracking %d",
-                    event_ticker, api_total, tracked,
-                )
-                return False
+        _verify_queue.put(event_ticker)
+        return False  # conservative: reject until verified
 
     return True
 
@@ -1393,6 +1413,15 @@ def main() -> None:
     ws_client: Optional[KalshiWSClient] = None
     event_queue: queue.Queue = queue.Queue()
     threads: list[threading.Thread] = []
+
+    verify_thread = threading.Thread(
+        target=_verification_worker,
+        args=(stop_event,),
+        daemon=True,
+        name="event-verify",
+    )
+    verify_thread.start()
+    threads.append(verify_thread)
 
     global _ws_client
     if not args.no_ws:
