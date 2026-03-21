@@ -142,19 +142,26 @@ _ticker_to_event_key: dict[str, str] = {}
 _event_size_cache: dict[str, tuple[int, float]] = {}
 _EVENT_SIZE_CACHE_TTL = 3600.0  # re-verify once per hour
 
+# Events whose count has been confirmed via a direct API call (not just prewarm).
+# Prewarm counts may be low (e.g. Draw market not yet open), so we verify once
+# per TTL before trusting n == total as "complete".
+_event_size_verified: set = set()
+
 
 def _prewarm_event_size_cache(markets: list) -> None:
     """
-    Populate _event_size_cache from the full (unfiltered) market list returned
-    by fetch_active_markets().  Called once per full scan so that
-    _event_is_complete / _event_total_count never need to hit the API during
-    normal operation — they just read the pre-warmed cache instead.
+    Populate _event_size_cache from the full (unfiltered) market list.
+    Only raises counts — never lowers an API-verified value.
     """
     from collections import Counter
     counts = Counter(m.get("event_ticker") for m in markets if m.get("event_ticker"))
     now_ts = time.time()
     for evt, cnt in counts.items():
-        _event_size_cache[evt] = (cnt, now_ts)
+        existing = _event_size_cache.get(evt)
+        if existing is None or cnt > existing[0]:
+            _event_size_cache[evt] = (cnt, now_ts)
+            # New or increased count → requires re-verification
+            _event_size_verified.discard(evt)
     logger.debug("Event size cache pre-warmed: %d events", len(counts))
 
 
@@ -162,26 +169,46 @@ def _event_is_complete(event_ticker: str, tracked: int) -> bool:
     """
     Return True if `tracked` outcomes == all open outcomes for this event.
 
-    Fetches the real count from the API on first call per event (then caches
-    for 1 hour).  A mismatch means we're missing outcomes due to the
-    volume_24h filter — the apparent underround is spurious.
+    Uses a two-tier approach:
+    1. Prewarm cache from full market listing (fast, may undercount if some
+       markets haven't opened yet, e.g. soccer Draw outcome).
+    2. API verification the first time n == cached_total — catches cases where
+       the prewarm count is too low (Draw not yet open → prewarm shows 2,
+       but API confirms 3).  Result is cached so the API is called at most
+       once per event per TTL hour.
     """
     now = time.time()
     cached = _event_size_cache.get(event_ticker)
     if cached and (now - cached[1]) < _EVENT_SIZE_CACHE_TTL:
         total = cached[0]
     else:
+        # Cache miss or TTL expired — fetch from API
         total = fetch_event_market_count(event_ticker)
         if total > 0:
             _event_size_cache[event_ticker] = (total, now)
+            _event_size_verified.add(event_ticker)
 
     if total > 0 and total != tracked:
         logger.debug(
-            "Incomplete event  %s: tracking %d of %d total outcomes — "
-            "sum is partial, not real arb",
+            "Incomplete event %s: tracking %d of %d total outcomes",
             event_ticker, tracked, total,
         )
         return False
+
+    # n == total (looks complete) but prewarm may have undercounted.
+    # Verify via API once per TTL to catch missing outcomes (e.g. Draw not yet open).
+    if event_ticker not in _event_size_verified:
+        api_total = fetch_event_market_count(event_ticker)
+        if api_total > 0:
+            _event_size_cache[event_ticker] = (api_total, now)
+            _event_size_verified.add(event_ticker)
+            if api_total != tracked:
+                logger.debug(
+                    "API-verified incomplete: event=%s has %d markets, tracking %d",
+                    event_ticker, api_total, tracked,
+                )
+                return False
+
     return True
 
 
