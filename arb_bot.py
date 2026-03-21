@@ -418,15 +418,6 @@ def compute_opportunity(market: dict, source: str = "REST") -> Optional[dict]:
     if any(p <= MIN_LEG_PRICE for p in ask_prices):
         return None
 
-    # Guard: if this market is one of several buckets in a multi-outcome event
-    # (e.g. temperature ranges, score bands), the NO side bundles all other
-    # outcomes — YES+NO < 1.0 is structural, not a real binary arb.
-    event_ticker = market.get("event_ticker", "")
-    if event_ticker:
-        total = _event_total_count(event_ticker)
-        if total > 1:
-            return None
-
     sum_asks = sum(ask_prices)
     if sum_asks >= 1.0:
         return None
