@@ -54,7 +54,6 @@ from db import (
     get_authorized_opportunities,
     get_complete_trades,
     get_trade,
-    has_fresh_detection,
     mark_likely_resolved,
     set_authorized,
     stamp_trader_invoked,
@@ -326,15 +325,21 @@ def _unwind(trade_id: int, filled_legs: list[dict]) -> None:
 # Core execution
 # ---------------------------------------------------------------------------
 
-def execute_trade(opp: dict) -> None:
+def execute_trade(opp: dict, event_driven: bool = False) -> None:
     """
     Execute a two-phase arb trade for an authorized opportunity.
     All state is written to the trades table.
+
+    event_driven: True when called from a WS/REST detection trigger.
+                  Only then is trader_invoked_at stamped (so the UI shows
+                  "preflight fail" only for genuine detection-triggered attempts,
+                  not routine poll retries).
     """
     opp_id = opp["id"]
     mode   = "DEMO" if DEMO_MODE else "LIVE"
     logger.info("=== TRADE START [%s] opp_id=%d  %s ===", mode, opp_id, opp.get("title", ""))
-    stamp_trader_invoked(opp_id)
+    if event_driven:
+        stamp_trader_invoked(opp_id)
 
     # ── Pre-flight ───────────────────────────────────────────────────────────
     verified, abort_reason = _preflight(opp)
@@ -582,19 +587,12 @@ def trading_loop(stop_event: threading.Event,
                     opps.sort(key=lambda o: 0 if o["id"] in pri else 1)
 
                 logger.info("Trading loop: %d authorized opportunity/ies [%s]",
-                            len(opps), "event" if triggered else "poll")
+                            len(opps), "event" if triggered else "poll")  # noqa: F821
                 # One trade at a time — acquire lock and try each opp in priority order
                 if _trade_lock.acquire(blocking=False):
                     try:
                         for opp in opps:
-                            # Poll-mode: skip opps with no fresh detection since last invocation
-                            if not triggered:
-                                invoked_at = opp.get("trader_invoked_at")
-                                if invoked_at and not has_fresh_detection(opp["ticker"], invoked_at):
-                                    logger.debug("Poll: skipping opp_id=%d (no fresh detection since %s)",
-                                                 opp["id"], invoked_at)
-                                    continue
-                            if execute_trade(opp):  # True = trade attempted; stop iterating
+                            if execute_trade(opp, event_driven=triggered):  # True = trade attempted; stop iterating
                                 break
                     finally:
                         _trade_lock.release()

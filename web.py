@@ -162,11 +162,20 @@ TEMPLATE = """<!doctype html>
       <a class="nav-link {{ 'active fw-semibold' if category == 'ignored' }}"
          href="/?cat=ignored">Ignored</a>
     </li>
+    <li class="nav-item ms-auto d-flex align-items-center pe-2">
+      <form method="post" action="/add-market" class="d-flex gap-1 align-items-center">
+        <input type="hidden" name="cat" value="{{ category }}">
+        <input type="text" name="ticker" placeholder="Add ticker…"
+               class="form-control form-control-sm" style="width:210px"
+               title="Enter an event ticker (e.g. KXNHLGAME-26MAR21WPGPIT) or market ticker">
+        <button type="submit" class="btn btn-sm btn-outline-secondary">+ Watch</button>
+      </form>
+    </li>
     {% if trading_enabled %}
-    <li class="nav-item ms-auto">
+    <li class="nav-item d-flex align-items-center">
       <a class="nav-link text-success fw-semibold" href="/authorized">&#9889; Authorized</a>
     </li>
-    <li class="nav-item">
+    <li class="nav-item d-flex align-items-center">
       <a class="nav-link text-success fw-semibold" href="/trades">&#128200; Trades</a>
     </li>
     {% endif %}
@@ -975,6 +984,69 @@ def delete_row(row_id: int):
     except Exception:
         pass
     return redirect(url_for("index", cat=cat) if cat else url_for("index"))
+
+
+@app.route("/add-market", methods=["POST"])
+def add_market():
+    """Manually add a market (by event ticker or market ticker) to the opportunities table."""
+    from fetcher import fetch_markets_by_event_or_ticker, fetch_market_prices
+    from db import save_opportunity
+    query = request.form.get("ticker", "").strip().upper()
+    cat   = request.form.get("cat", "")
+    back  = url_for("index", cat=cat) if cat else url_for("index")
+    if not query:
+        return redirect(back)
+    try:
+        markets = fetch_markets_by_event_or_ticker(query)
+        if not markets:
+            logger.warning("add-market: no markets found for %s", query)
+            return redirect(back)
+
+        tickers = [m["ticker"] for m in markets]
+        prices  = fetch_market_prices(tickers)
+
+        ask_prices, ask_sizes, outcomes, outcome_tickers = [], [], [], []
+        for m in markets:
+            p        = prices.get(m["ticker"], {})
+            yes_ask  = p.get("yes_ask") if p.get("yes_ask") is not None else (m.get("seed_yes_ask") or 0.5)
+            yes_size = p.get("yes_ask_size") or m.get("seed_yes_ask_size") or 0
+            ask_prices.append(yes_ask)
+            ask_sizes.append(yes_size)
+            outcomes.append(m.get("title", m["ticker"]))
+            outcome_tickers.append(m["ticker"])
+
+        n            = len(markets)
+        way_label    = f"[{n}-way]" if n > 1 else "[binary]"
+        sum_asks     = sum(ask_prices)
+        gross_profit = 1.0 - sum_asks
+        total_fees   = sum(TAKER_FEE_COEFF * p * (1 - p) for p in ask_prices)
+        net_profit   = gross_profit - total_fees
+        first        = markets[0]
+        event_ticker = first.get("event_ticker") or first["ticker"]
+
+        save_opportunity({
+            "ticker":          event_ticker,
+            "event_ticker":    event_ticker,
+            "title":           f"{way_label} {first.get('title', query)}",
+            "outcomes":        outcomes,
+            "outcome_tickers": outcome_tickers,
+            "ask_prices":      ask_prices,
+            "ask_sizes":       ask_sizes,
+            "sum_asks":        sum_asks,
+            "gross_profit":    gross_profit,
+            "total_fees":      total_fees,
+            "net_profit":      net_profit,
+            "taker_fee_coeff": TAKER_FEE_COEFF,
+            "source":          "MANUAL",
+            "category":        "opportunity",
+            "has_zero_size":   any(s <= 0 for s in ask_sizes),
+            "close_time":      first.get("close_time"),
+            "volume_24h":      min(m.get("volume_24h", 0) for m in markets),
+            "event_slug":      "",
+        })
+    except Exception as exc:
+        logger.error("add-market(%s) error: %s", query, exc)
+    return redirect(back)
 
 
 @app.route("/authorize/<int:row_id>", methods=["POST"])

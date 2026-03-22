@@ -456,6 +456,64 @@ def fetch_event_market_count(event_ticker: str) -> int:
         return 0
 
 
+def fetch_markets_by_event_or_ticker(query: str) -> list[dict]:
+    """
+    Fetch markets for a manually-specified ticker (event or individual market).
+    No volume filter — used when the user explicitly adds a market to watch.
+
+    Strategy:
+      1. Try as event_ticker → returns all outcome markets for that event.
+      2. Try as single market ticker → if it belongs to an event, fetch the full event.
+    """
+    def _parse_raw(m: dict) -> Optional[dict]:
+        ticker = m.get("ticker", "")
+        if not ticker:
+            return None
+        return {
+            "ticker":            ticker,
+            "event_ticker":      m.get("event_ticker", ""),
+            "title":             m.get("title") or m.get("yes_sub_title") or ticker,
+            "subtitle":          m.get("subtitle") or m.get("event_sub_title") or "",
+            "close_time":        m.get("close_time") or m.get("expiration_time") or "",
+            "seed_yes_ask":      _parse_price(m.get("yes_ask_dollars") or m.get("yes_ask")),
+            "seed_no_ask":       _parse_price(m.get("no_ask_dollars")  or m.get("no_ask")),
+            "seed_yes_ask_size": float(m.get("yes_ask_size_fp") or m.get("yes_ask_size") or 0),
+            "seed_no_ask_size":  float(m.get("no_ask_size_fp")  or m.get("no_ask_size")  or 0),
+            "volume_24h":        float(m.get("volume_24h_fp") or 0),
+        }
+
+    # 1. Try as event ticker
+    try:
+        data = _get("/markets", params={"event_ticker": query, "status": "open", "limit": 200})
+        markets = [_parse_raw(m) for m in data.get("markets", [])]
+        markets = [m for m in markets if m]
+        if markets:
+            return markets
+    except Exception as exc:
+        logger.warning("fetch_markets_by_event_or_ticker(event=%s): %s", query, exc)
+
+    # 2. Try as individual market ticker
+    try:
+        data = _get("/markets", params={"tickers": query, "limit": 1})
+        raw_list = data.get("markets", [])
+        if raw_list:
+            raw = raw_list[0]
+            event_ticker = raw.get("event_ticker", "")
+            # If it belongs to a multi-outcome event, fetch siblings too
+            if event_ticker and event_ticker.upper() != query.upper():
+                data2 = _get("/markets", params={"event_ticker": event_ticker, "status": "open", "limit": 200})
+                siblings = [_parse_raw(m) for m in data2.get("markets", [])]
+                siblings = [m for m in siblings if m]
+                if siblings:
+                    return siblings
+            parsed = _parse_raw(raw)
+            return [parsed] if parsed else []
+    except Exception as exc:
+        logger.warning("fetch_markets_by_event_or_ticker(ticker=%s): %s", query, exc)
+
+    return []
+
+
 def fetch_market_prices(tickers: list[str]) -> dict[str, dict]:
     """
     Batch-refresh best-ask prices for a list of tickers.
