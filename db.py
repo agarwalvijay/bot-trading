@@ -238,6 +238,29 @@ def init_db() -> None:
             )
             con.execute("UPDATE opportunities SET market_key = ? WHERE id = ?", (mkey, r["id"]))
 
+        # Migration bridge: preserve legacy row-based authorizations.
+        # Older DBs may have opportunities.authorized=1 but no authorized_markets rows.
+        legacy_auth = con.execute("""
+            SELECT market_key,
+                   MAX(detected_at) AS authorized_at,
+                   MAX(id) AS row_id
+            FROM opportunities
+            WHERE authorized = 1
+              AND market_key IS NOT NULL
+              AND market_key <> ''
+            GROUP BY market_key
+        """).fetchall()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for r in legacy_auth:
+            con.execute("""
+                INSERT INTO authorized_markets
+                    (market_key, active, authorized_at, authorized_by_row_id,
+                     successful_trade_id, successful_order_id, successful_at,
+                     disabled_at, disabled_reason)
+                VALUES (?, 1, ?, ?, NULL, NULL, NULL, NULL, NULL)
+                ON CONFLICT(market_key) DO NOTHING
+            """, (r["market_key"], r["authorized_at"] or now_iso, r["row_id"]))
+
 
 def _add_column_if_missing(con: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     existing = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}

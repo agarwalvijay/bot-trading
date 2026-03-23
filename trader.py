@@ -414,7 +414,7 @@ def execute_trade(opp: dict, event_driven: bool = False) -> bool:
             final_status="phase1_place_error",
             preflight_reason=f"phase1_place_error: {exc}",
         )
-        return False
+        return True  # trade attempt failed — stop this tick to avoid rapid churn
 
     filled1 = _wait_for_fill(oid1, FILL_TIMEOUT_SECS)
     if not filled1 or filled1.get("filled_count", 0) == 0:
