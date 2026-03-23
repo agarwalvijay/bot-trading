@@ -1,5 +1,6 @@
 # Secrets & local config
 .env
+keys/
 
 # Database
 *.db
