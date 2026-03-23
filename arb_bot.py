@@ -58,7 +58,8 @@ from config import (
 from db import (
     init_db, opportunity_count, save_opportunity, update_opportunity,
     load_markets_from_cache, save_markets_cache, markets_cache_count,
-    get_authorized_market_keys, increment_ws_counter, is_market_authorized,
+    get_authorized_market_keys, increment_ws_counter, increment_ws_watched_counter,
+    is_market_authorized,
 )
 from trader import settle_loop, trading_loop
 from market_key import canonical_market_key
@@ -959,6 +960,8 @@ def ws_event_loop(event_queue: queue.Queue, stop_event: threading.Event) -> None
     and immediately scan affected markets for arb opportunities.
     """
     logger.info("WebSocket event loop started")
+    auth_keys_cache: set[str] = set()
+    auth_keys_cache_ts = 0.0
     while not stop_event.is_set():
         try:
             event = event_queue.get(timeout=1.0)
@@ -987,6 +990,21 @@ def ws_event_loop(event_queue: queue.Queue, stop_event: threading.Event) -> None
             ticker = msg.get("market_ticker", "")
             if not ticker:
                 continue
+
+            now_ts = time.time()
+            if now_ts - auth_keys_cache_ts >= 5.0:
+                try:
+                    auth_keys_cache = set(get_authorized_market_keys())
+                except Exception:
+                    auth_keys_cache = set()
+                auth_keys_cache_ts = now_ts
+
+            watched_key = _ticker_to_event_key.get(ticker)
+            if not watched_key:
+                m = markets_by_ticker.get(ticker, {})
+                watched_key = m.get("event_ticker") or ticker
+            if watched_key and watched_key in auth_keys_cache:
+                increment_ws_watched_counter()
 
             yes_ask = _parse_ws_price(msg.get("yes_ask_dollars") or msg.get("yes_ask"))
             no_ask  = _parse_ws_price(msg.get("no_ask_dollars")  or msg.get("no_ask"))

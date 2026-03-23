@@ -150,6 +150,13 @@ TEMPLATE = """<!doctype html>
         <div class="text-muted small">since {{ stats.ws_since }}</div>
       </div>
     </div>
+    <div class="col-auto">
+      <div class="card stat-card text-center px-2 py-1">
+        <div class="text-muted small">WS watched</div>
+        <div class="fs-6 fw-bold text-info">{{ stats.ws_watched_count }}</div>
+        <div class="text-muted small">since {{ stats.ws_watched_since }}</div>
+      </div>
+    </div>
   </div>
 
   <div class="d-flex justify-content-between align-items-center mb-2">
@@ -1308,6 +1315,10 @@ def _get_stats() -> dict:
             ws_row = con.execute("SELECT count, started_at FROM ws_counter WHERE id = 1").fetchone()
         except sqlite3.OperationalError:
             ws_row = None
+        try:
+            ws_watched_row = con.execute("SELECT count, started_at FROM ws_counter_watched WHERE id = 1").fetchone()
+        except sqlite3.OperationalError:
+            ws_watched_row = None
         con.close()
         # tracked markets count from arb_bot (same-process mode), else fallback to DB cache
         try:
@@ -1320,18 +1331,22 @@ def _get_stats() -> dict:
         min_vol = int(MIN_VOLUME_24H) if MIN_VOLUME_24H > 0 else "off"
         ws_count = int(ws_row[0]) if ws_row and ws_row[0] is not None else 0
         ws_since = _time_ago(ws_row[1]) if ws_row and ws_row[1] else "—"
+        ws_watched_count = int(ws_watched_row[0]) if ws_watched_row and ws_watched_row[0] is not None else 0
+        ws_watched_since = _time_ago(ws_watched_row[1]) if ws_watched_row and ws_watched_row[1] else "—"
         return {"total": total, "opps": opps, "near_miss": near_miss,
                 "cumulative": cumulative, "non_exhaustive": non_exhaustive,
                 "spread_market": spread_market, "ignored": ignored,
                 "likely_resolved": likely_resolved, "last_seen_ago": _time_ago(last),
                 "tracked_markets": tracked, "min_volume_24h": min_vol,
-                "ws_count": ws_count, "ws_since": ws_since}
+                "ws_count": ws_count, "ws_since": ws_since,
+                "ws_watched_count": ws_watched_count, "ws_watched_since": ws_watched_since}
     except Exception:
         return {"total": 0, "opps": 0, "near_miss": 0,
                 "cumulative": 0, "non_exhaustive": 0, "spread_market": 0,
                 "ignored": 0, "likely_resolved": 0, "last_seen_ago": "—",
                 "tracked_markets": "—", "min_volume_24h": "—",
-                "ws_count": 0, "ws_since": "—"}
+                "ws_count": 0, "ws_since": "—",
+                "ws_watched_count": 0, "ws_watched_since": "—"}
 
 
 # ---------------------------------------------------------------------------

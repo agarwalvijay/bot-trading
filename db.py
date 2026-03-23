@@ -176,6 +176,14 @@ def init_db() -> None:
             )
         """)
         con.execute("""
+            CREATE TABLE IF NOT EXISTS ws_counter_watched (
+                id         INTEGER PRIMARY KEY CHECK (id = 1),
+                count      INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT,
+                updated_at TEXT
+            )
+        """)
+        con.execute("""
             CREATE TABLE IF NOT EXISTS trade_attempts (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
                 opportunity_id   INTEGER,
@@ -194,6 +202,10 @@ def init_db() -> None:
         con.execute("CREATE INDEX IF NOT EXISTS idx_attempts_market_key ON trade_attempts (market_key)")
         con.execute("""
             INSERT OR IGNORE INTO ws_counter (id, count, started_at, updated_at)
+            VALUES (1, 0, NULL, NULL)
+        """)
+        con.execute("""
+            INSERT OR IGNORE INTO ws_counter_watched (id, count, started_at, updated_at)
             VALUES (1, 0, NULL, NULL)
         """)
         _add_column_if_missing(con, "trades",        "exit_prices",      "TEXT NOT NULL DEFAULT '[]'")
@@ -548,6 +560,42 @@ def increment_ws_counter(delta: int = 1, max_count: int = 10000) -> None:
         else:
             con.execute(
                 "UPDATE ws_counter SET count = ?, started_at = ?, updated_at = ? WHERE id = 1",
+                (new_count, started_at, now),
+            )
+
+
+def increment_ws_watched_counter(delta: int = 1, max_count: int = 10000) -> None:
+    """
+    Increment persistent WS notification counter for authorized/watched markets.
+    Resets to 0 and restarts timer when count reaches max_count.
+    """
+    if delta <= 0:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as con:
+        row = con.execute(
+            "SELECT count, started_at FROM ws_counter_watched WHERE id = 1"
+        ).fetchone()
+        if not row:
+            con.execute(
+                "INSERT INTO ws_counter_watched (id, count, started_at, updated_at) VALUES (1, 0, ?, ?)",
+                (now, now),
+            )
+            curr = 0
+            started_at = now
+        else:
+            curr = int(row["count"] or 0)
+            started_at = row["started_at"] or now
+
+        new_count = curr + delta
+        if new_count >= max_count:
+            con.execute(
+                "UPDATE ws_counter_watched SET count = 0, started_at = ?, updated_at = ? WHERE id = 1",
+                (now, now),
+            )
+        else:
+            con.execute(
+                "UPDATE ws_counter_watched SET count = ?, started_at = ?, updated_at = ? WHERE id = 1",
                 (new_count, started_at, now),
             )
 
