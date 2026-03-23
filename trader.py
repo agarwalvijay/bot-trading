@@ -33,6 +33,8 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from config import (
+    AGGRESSIVE_ENTRY_ENABLED,
+    PHASE1_ENTRY_OFFSET,
     ALLOW_DIRECTIONAL_HOLD,
     DEMO_MODE,
     FILL_TIMEOUT_SECS,
@@ -43,6 +45,7 @@ from config import (
     SETTLE_MIN_PROFIT_RATIO,
     SETTLE_POLL_INTERVAL,
     SETTLE_SKIP_IF_EXPIRY_MINS,
+    SNAPSHOT_MAX_AGE_MS,
     TAKER_FEE_COEFF,
     TRADE_POLL_INTERVAL,
     TRADING_ENABLED,
@@ -55,6 +58,7 @@ from db import (
     get_authorized_opportunities,
     get_complete_trades,
     get_trade,
+    increment_metric_counter,
     mark_market_success,
     mark_likely_resolved,
     stamp_trader_invoked,
@@ -117,9 +121,9 @@ def _wait_for_fill(order_id: str, timeout_secs: float) -> Optional[dict]:
 # Pre-flight price check
 # ---------------------------------------------------------------------------
 
-def _preflight(opp: dict) -> tuple[Optional[dict], Optional[str]]:
+def _preflight(opp: dict, snapshot: Optional[dict] = None) -> tuple[Optional[dict], Optional[str]]:
     """
-    Re-fetch current prices for all legs.
+    Build current leg book from WS snapshot (preferred) or REST re-fetch fallback.
 
     Returns (result_dict, None) on success, or (None, reason_str) on abort.
 
@@ -137,15 +141,34 @@ def _preflight(opp: dict) -> tuple[Optional[dict], Optional[str]]:
         logger.error("preflight: %s", reason)
         return None, reason
 
-    # For binary markets the single ticker IS the event ticker
-    if not outcome_tickers:
-        outcome_tickers = [opp["ticker"]]
-
-    current = fetch_market_prices(outcome_tickers)
-    if not current:
-        reason = "price_fetch_returned_nothing"
-        logger.warning("preflight: %s — abort", reason)
-        return None, reason
+    if snapshot:
+        triggered_at_ms = int(snapshot.get("triggered_at_ms") or 0)
+        age_ms = int(time.time() * 1000) - triggered_at_ms if triggered_at_ms else (SNAPSHOT_MAX_AGE_MS + 1)
+        if age_ms > SNAPSHOT_MAX_AGE_MS:
+            reason = f"stale_snapshot: age_ms={age_ms} > max={SNAPSHOT_MAX_AGE_MS}"
+            increment_metric_counter("preflight_reject_stale_snapshot")
+            logger.info("preflight: %s — abort", reason)
+            return None, reason
+        snap_legs = snapshot.get("legs") or []
+        snap_by_ticker = {str(l.get('ticker', '')): l for l in snap_legs}
+        if not outcome_tickers:
+            outcome_tickers = [t for t in snap_by_ticker.keys() if t] or [opp["ticker"]]
+        current = {}
+        for t in outcome_tickers:
+            sl = snap_by_ticker.get(t) or {}
+            current[t] = {
+                "yes_ask": sl.get("price"),
+                "yes_ask_size": sl.get("size", 0.0),
+            }
+    else:
+        # For binary markets the single ticker IS the event ticker
+        if not outcome_tickers:
+            outcome_tickers = [opp["ticker"]]
+        current = fetch_market_prices(outcome_tickers)
+        if not current:
+            reason = "price_fetch_returned_nothing"
+            logger.warning("preflight: %s — abort", reason)
+            return None, reason
 
     legs = []
     for i, ticker in enumerate(outcome_tickers):
@@ -173,27 +196,47 @@ def _preflight(opp: dict) -> tuple[Optional[dict], Optional[str]]:
             "logged_size":  logged_sizes[i] if i < len(logged_sizes) else 0.0,
         })
 
-    curr_sum   = sum(l["price"] for l in legs)
-    gross      = 1.0 - curr_sum
-    fees       = sum(TAKER_FEE_COEFF * l["price"] * (1 - l["price"]) for l in legs)
-    net_profit = gross - fees
+    raw_sum   = sum(l["price"] for l in legs)
+    raw_gross = 1.0 - raw_sum
+    raw_fees  = sum(TAKER_FEE_COEFF * l["price"] * (1 - l["price"]) for l in legs)
+    raw_net_profit = raw_gross - raw_fees
 
-    if curr_sum >= 1.0:
-        reason = f"sum_ge_1: sum={curr_sum:.4f}"
+    if raw_sum >= 1.0:
+        reason = f"sum_ge_1: sum={raw_sum:.4f}"
         logger.info("preflight: %s — no arb, abort", reason)
-        return None, reason
-
-    if net_profit < MIN_NET_PROFIT:
-        reason = f"net_profit_too_low: {net_profit*100:.3f}% < min={MIN_NET_PROFIT*100:.3f}%"
-        logger.info("preflight: %s — abort", reason)
         return None, reason
 
     # Sort least→most liquid (smallest size first = Phase 1 leg)
     legs.sort(key=lambda l: l["size"])
 
+    # Optional aggressive entry for phase1; require margin even with this worst-case.
+    for leg in legs:
+        leg["order_price"] = leg["price"]
+    if AGGRESSIVE_ENTRY_ENABLED and PHASE1_ENTRY_OFFSET > 0 and legs:
+        legs[0]["order_price"] = min(0.99, legs[0]["price"] + PHASE1_ENTRY_OFFSET)
+
+    effective_prices = [l["order_price"] for l in legs]
+    eff_sum   = sum(effective_prices)
+    eff_gross = 1.0 - eff_sum
+    eff_fees  = sum(TAKER_FEE_COEFF * p * (1 - p) for p in effective_prices)
+    eff_net_profit = eff_gross - eff_fees
+
+    if eff_sum >= 1.0:
+        reason = f"sum_ge_1_after_aggressive: sum={eff_sum:.4f}"
+        logger.info("preflight: %s — abort", reason)
+        return None, reason
+
+    if eff_net_profit < MIN_NET_PROFIT:
+        reason = (
+            f"net_profit_too_low_after_aggressive: "
+            f"{eff_net_profit*100:.3f}% < min={MIN_NET_PROFIT*100:.3f}%"
+        )
+        logger.info("preflight: %s — abort", reason)
+        return None, reason
+
     # Cap contract count: min(available_size, MAX_CONTRACTS_PER_TRADE, budget-based cap)
-    # Total cost = curr_sum * count  (each contract costs its ask price)
-    budget_count = int(MAX_TRADE_COST / curr_sum) if curr_sum > 0 else MAX_CONTRACTS_PER_TRADE
+    # Total cost = effective sum * count  (phase1 may use aggressive limit)
+    budget_count = int(MAX_TRADE_COST / eff_sum) if eff_sum > 0 else MAX_CONTRACTS_PER_TRADE
     max_count = min(int(min(l["size"] for l in legs)), MAX_CONTRACTS_PER_TRADE, budget_count)
     if max_count <= 0:
         reason = "zero_contracts_available"
@@ -201,11 +244,11 @@ def _preflight(opp: dict) -> tuple[Optional[dict], Optional[str]]:
         return None, reason
 
     logger.info(
-        "preflight OK: sum=%.4f  net=+%.2f%%  contracts=%d  legs=%s",
-        curr_sum, net_profit * 100, max_count,
-        [(l["ticker"], l["price"]) for l in legs],
+        "preflight OK: raw_sum=%.4f raw_net=+%.2f%%  eff_sum=%.4f eff_net=+%.2f%%  contracts=%d  legs=%s",
+        raw_sum, raw_net_profit * 100, eff_sum, eff_net_profit * 100, max_count,
+        [(l["ticker"], l["price"], l["order_price"]) for l in legs],
     )
-    return {"legs": legs, "count": max_count, "net_profit": net_profit, "sum": curr_sum}, None
+    return {"legs": legs, "count": max_count, "net_profit": eff_net_profit, "sum": eff_sum}, None
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +370,7 @@ def _unwind(trade_id: int, filled_legs: list[dict]) -> None:
 # Core execution
 # ---------------------------------------------------------------------------
 
-def execute_trade(opp: dict, event_driven: bool = False) -> bool:
+def execute_trade(opp: dict, event_driven: bool = False, snapshot: Optional[dict] = None) -> bool:
     """
     Execute a two-phase arb trade for an authorized opportunity.
     All state is written to the trades table.
@@ -350,12 +393,18 @@ def execute_trade(opp: dict, event_driven: bool = False) -> bool:
         stamp_trader_invoked(opp_id)
 
     # ── Pre-flight ───────────────────────────────────────────────────────────
-    verified, abort_reason = _preflight(opp)
+    verified, abort_reason = _preflight(opp, snapshot=snapshot if event_driven else None)
     if verified is None:
         if abort_reason and abort_reason.startswith("likely_resolved:"):
             mark_likely_resolved(opp_id)
             logger.info("Auto-deauthorized likely-resolved opp_id=%d: %s", opp_id, abort_reason)
-        elif abort_reason and any(abort_reason.startswith(p) for p in ("sum_ge_1:", "net_profit_too_low:")):
+        elif abort_reason and any(abort_reason.startswith(p) for p in (
+            "sum_ge_1:",
+            "net_profit_too_low:",
+            "sum_ge_1_after_aggressive:",
+            "net_profit_too_low_after_aggressive:",
+            "stale_snapshot:",
+        )):
             # Arb temporarily closed — stay authorized to catch next reappearance, don't spam logs
             logger.debug("Preflight (opp_id=%d): %s — waiting for arb to reopen", opp_id, abort_reason)
         else:
@@ -393,13 +442,14 @@ def execute_trade(opp: dict, event_driven: bool = False) -> bool:
 
     # ── Phase 1: least-liquid leg ────────────────────────────────────────────
     leg1 = legs[0]
-    logger.info("Phase 1: %s  count=%d  price=%.4f  coid=%s",
-                leg1["ticker"], count, leg1["price"], coids[0])
+    phase1_price = leg1.get("order_price", leg1["price"])
+    logger.info("Phase 1: %s  count=%d  price=%.4f (book=%.4f)  coid=%s",
+                leg1["ticker"], count, phase1_price, leg1["price"], coids[0])
     update_trade(trade_id, status="phase1_placed")
 
     try:
         order1 = place_order(leg1["ticker"], "buy", "yes", count,
-                             leg1["price"], client_order_id=coids[0])
+                             phase1_price, client_order_id=coids[0])
         oid1 = order1.get("order_id", "")
         order_ids.append(oid1)
         update_trade(trade_id, order_ids=json.dumps(order_ids))
@@ -599,7 +649,9 @@ def execute_trade(opp: dict, event_driven: bool = False) -> bool:
 
 def trading_loop(stop_event: threading.Event,
                  trade_trigger: Optional[threading.Event] = None,
-                 priority_ids=None) -> None:
+                 priority_ids=None,
+                 priority_snapshots=None,
+                 priority_snapshots_lock=None) -> None:
     """
     Poll for authorized opportunities and execute trades one at a time.
     Runs as a background thread started from arb_bot.main().
@@ -607,6 +659,7 @@ def trading_loop(stop_event: threading.Event,
     trade_trigger: optional Event set by WS/REST handlers when a fresh arb is
     detected. Wakes the loop immediately rather than waiting TRADE_POLL_INTERVAL.
     priority_ids: optional deque of market_keys to try first this tick.
+    priority_snapshots: optional dict[market_key] -> ws snapshot payload.
     """
     if not TRADING_ENABLED:
         logger.info("Trading disabled (TRADING_ENABLED=false) — trading loop not running")
@@ -638,7 +691,15 @@ def trading_loop(stop_event: threading.Event,
                 if _trade_lock.acquire(blocking=False):
                     try:
                         for opp in opps:
-                            if execute_trade(opp, event_driven=triggered):  # True = trade attempted; stop iterating
+                            snap = None
+                            if triggered and priority_snapshots is not None:
+                                mk = opp.get("market_key") or opp.get("ticker")
+                                if priority_snapshots_lock is not None:
+                                    with priority_snapshots_lock:
+                                        snap = priority_snapshots.pop(mk, None)
+                                else:
+                                    snap = priority_snapshots.pop(mk, None)
+                            if execute_trade(opp, event_driven=triggered, snapshot=snap):  # True = trade attempted; stop iterating
                                 break
                     finally:
                         _trade_lock.release()

@@ -144,18 +144,45 @@ TEMPLATE = """<!doctype html>
       </div>
     </div>
     <div class="col-auto">
-      <div class="card stat-card text-center px-2 py-1">
-        <div class="text-muted small">WS notifications</div>
-        <div class="fs-6 fw-bold text-primary">{{ stats.ws_count }}</div>
-        <div class="text-muted small">since {{ stats.ws_since }}</div>
-      </div>
+      <form method="post" action="/reset-counter/ws"
+            onsubmit="return confirm('Reset WS notifications counter?');">
+        <input type="hidden" name="cat" value="{{ category }}">
+        <input type="hidden" name="view" value="{{ view_mode }}">
+        <button type="submit" class="card stat-card text-center px-2 py-1" style="border:1px solid #dee2e6; background:#fff;">
+          <div class="text-muted small">WS notifications</div>
+          <div class="fs-6 fw-bold text-primary">{{ stats.ws_count }}</div>
+          <div class="text-muted small">since {{ stats.ws_since }}</div>
+        </button>
+      </form>
     </div>
     <div class="col-auto">
-      <div class="card stat-card text-center px-2 py-1">
-        <div class="text-muted small">WS watched</div>
-        <div class="fs-6 fw-bold text-info">{{ stats.ws_watched_count }}</div>
-        <div class="text-muted small">since {{ stats.ws_watched_since }}</div>
-      </div>
+      <form method="post" action="/reset-counter/ws_watched"
+            onsubmit="return confirm('Reset WS watched counter?');">
+        <input type="hidden" name="cat" value="{{ category }}">
+        <input type="hidden" name="view" value="{{ view_mode }}">
+        <button type="submit" class="card stat-card text-center px-2 py-1" style="border:1px solid #dee2e6; background:#fff;">
+          <div class="text-muted small">WS watched</div>
+          <div class="fs-6 fw-bold text-info">{{ stats.ws_watched_count }}</div>
+          <div class="text-muted small">since {{ stats.ws_watched_since }}</div>
+        </button>
+      </form>
+    </div>
+    <div class="col-auto">
+      <form method="post" action="/reset-counter/ws_gate_rejects"
+            onsubmit="return confirm('Reset WS gate reject counters?');">
+        <input type="hidden" name="cat" value="{{ category }}">
+        <input type="hidden" name="view" value="{{ view_mode }}">
+        <button type="submit" class="card stat-card text-center px-2 py-1" style="border:1px solid #dee2e6; background:#fff;">
+          <div class="text-muted small">WS gate rejects</div>
+          <div class="fs-6 fw-bold text-danger">{{ stats.ws_gate_reject_total }}</div>
+          <div class="text-muted small">
+            miss {{ stats.ws_gate_reject_missing_ts }}
+            age {{ stats.ws_gate_reject_age }}
+            skew {{ stats.ws_gate_reject_skew }}
+            stale {{ stats.preflight_reject_stale_snapshot }}
+          </div>
+        </button>
+      </form>
     </div>
   </div>
 
@@ -1319,6 +1346,20 @@ def _get_stats() -> dict:
             ws_watched_row = con.execute("SELECT count, started_at FROM ws_counter_watched WHERE id = 1").fetchone()
         except sqlite3.OperationalError:
             ws_watched_row = None
+        try:
+            metric_rows = con.execute("""
+                SELECT metric, count
+                FROM metric_counters
+                WHERE metric IN (
+                    'ws_gate_reject_missing_ts',
+                    'ws_gate_reject_age',
+                    'ws_gate_reject_skew',
+                    'preflight_reject_stale_snapshot',
+                    'ws_gate_pass'
+                )
+            """).fetchall()
+        except sqlite3.OperationalError:
+            metric_rows = []
         con.close()
         # tracked markets count from arb_bot (same-process mode), else fallback to DB cache
         try:
@@ -1333,20 +1374,41 @@ def _get_stats() -> dict:
         ws_since = _time_ago(ws_row[1]) if ws_row and ws_row[1] else "—"
         ws_watched_count = int(ws_watched_row[0]) if ws_watched_row and ws_watched_row[0] is not None else 0
         ws_watched_since = _time_ago(ws_watched_row[1]) if ws_watched_row and ws_watched_row[1] else "—"
+        metric_map = {r[0]: int(r[1] or 0) for r in metric_rows}
+        ws_gate_reject_missing_ts = metric_map.get("ws_gate_reject_missing_ts", 0)
+        ws_gate_reject_age = metric_map.get("ws_gate_reject_age", 0)
+        ws_gate_reject_skew = metric_map.get("ws_gate_reject_skew", 0)
+        preflight_reject_stale_snapshot = metric_map.get("preflight_reject_stale_snapshot", 0)
+        ws_gate_pass = metric_map.get("ws_gate_pass", 0)
+        ws_gate_reject_total = (
+            ws_gate_reject_missing_ts
+            + ws_gate_reject_age
+            + ws_gate_reject_skew
+            + preflight_reject_stale_snapshot
+        )
         return {"total": total, "opps": opps, "near_miss": near_miss,
                 "cumulative": cumulative, "non_exhaustive": non_exhaustive,
                 "spread_market": spread_market, "ignored": ignored,
                 "likely_resolved": likely_resolved, "last_seen_ago": _time_ago(last),
                 "tracked_markets": tracked, "min_volume_24h": min_vol,
                 "ws_count": ws_count, "ws_since": ws_since,
-                "ws_watched_count": ws_watched_count, "ws_watched_since": ws_watched_since}
+                "ws_watched_count": ws_watched_count, "ws_watched_since": ws_watched_since,
+                "ws_gate_reject_missing_ts": ws_gate_reject_missing_ts,
+                "ws_gate_reject_age": ws_gate_reject_age,
+                "ws_gate_reject_skew": ws_gate_reject_skew,
+                "preflight_reject_stale_snapshot": preflight_reject_stale_snapshot,
+                "ws_gate_pass": ws_gate_pass,
+                "ws_gate_reject_total": ws_gate_reject_total}
     except Exception:
         return {"total": 0, "opps": 0, "near_miss": 0,
                 "cumulative": 0, "non_exhaustive": 0, "spread_market": 0,
                 "ignored": 0, "likely_resolved": 0, "last_seen_ago": "—",
                 "tracked_markets": "—", "min_volume_24h": "—",
                 "ws_count": 0, "ws_since": "—",
-                "ws_watched_count": 0, "ws_watched_since": "—"}
+                "ws_watched_count": 0, "ws_watched_since": "—",
+                "ws_gate_reject_missing_ts": 0, "ws_gate_reject_age": 0,
+                "ws_gate_reject_skew": 0, "preflight_reject_stale_snapshot": 0,
+                "ws_gate_pass": 0, "ws_gate_reject_total": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -1377,6 +1439,41 @@ def clear_all():
             con.execute("DELETE FROM opportunities WHERE category = ?", (cat,))
         else:
             con.execute("DELETE FROM opportunities")
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+    return redirect(url_for("index", cat=cat, view=view_mode) if cat else url_for("index", view=view_mode))
+
+
+@app.route("/reset-counter/<string:name>", methods=["POST"])
+def reset_counter(name: str):
+    cat = request.form.get("cat", "")
+    view_mode = request.form.get("view", "time")
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        con = sqlite3.connect(DB_PATH)
+        if name == "ws":
+            con.execute(
+                "UPDATE ws_counter SET count = 0, started_at = ?, updated_at = ? WHERE id = 1",
+                (now, now),
+            )
+        elif name == "ws_watched":
+            con.execute(
+                "UPDATE ws_counter_watched SET count = 0, started_at = ?, updated_at = ? WHERE id = 1",
+                (now, now),
+            )
+        elif name == "ws_gate_rejects":
+            con.execute("""
+                UPDATE metric_counters
+                SET count = 0, started_at = ?, updated_at = ?
+                WHERE metric IN (
+                    'ws_gate_reject_missing_ts',
+                    'ws_gate_reject_age',
+                    'ws_gate_reject_skew',
+                    'preflight_reject_stale_snapshot'
+                )
+            """, (now, now))
         con.commit()
         con.close()
     except Exception:

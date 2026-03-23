@@ -184,6 +184,14 @@ def init_db() -> None:
             )
         """)
         con.execute("""
+            CREATE TABLE IF NOT EXISTS metric_counters (
+                metric     TEXT PRIMARY KEY,
+                count      INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT,
+                updated_at TEXT
+            )
+        """)
+        con.execute("""
             CREATE TABLE IF NOT EXISTS trade_attempts (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
                 opportunity_id   INTEGER,
@@ -597,6 +605,46 @@ def increment_ws_watched_counter(delta: int = 1, max_count: int = 10000) -> None
             con.execute(
                 "UPDATE ws_counter_watched SET count = ?, started_at = ?, updated_at = ? WHERE id = 1",
                 (new_count, started_at, now),
+            )
+
+
+def increment_metric_counter(metric: str, delta: int = 1, max_count: int = 10000) -> None:
+    """
+    Increment a named persistent metric counter.
+    Resets to 0 and restarts timer when count reaches max_count.
+    """
+    if delta <= 0:
+        return
+    m = (metric or "").strip()
+    if not m:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as con:
+        row = con.execute(
+            "SELECT count, started_at FROM metric_counters WHERE metric = ?",
+            (m,),
+        ).fetchone()
+        if not row:
+            con.execute(
+                "INSERT INTO metric_counters (metric, count, started_at, updated_at) VALUES (?, 0, ?, ?)",
+                (m, now, now),
+            )
+            curr = 0
+            started_at = now
+        else:
+            curr = int(row["count"] or 0)
+            started_at = row["started_at"] or now
+
+        new_count = curr + delta
+        if new_count >= max_count:
+            con.execute(
+                "UPDATE metric_counters SET count = 0, started_at = ?, updated_at = ? WHERE metric = ?",
+                (now, now, m),
+            )
+        else:
+            con.execute(
+                "UPDATE metric_counters SET count = ?, started_at = ?, updated_at = ? WHERE metric = ?",
+                (new_count, started_at, now, m),
             )
 
 

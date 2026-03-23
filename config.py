@@ -92,6 +92,11 @@ HIGH_PROFIT_THRESHOLD = float(os.getenv("HIGH_PROFIT_THRESHOLD", "0.05"))
 WS_ALERT_COOLDOWN_SECS    = int(os.getenv("WS_ALERT_COOLDOWN_SECS", "60"))
 WS_MIN_PROFIT_IMPROVEMENT = float(os.getenv("WS_MIN_PROFIT_IMPROVEMENT", "0.005"))
 
+# WS-trigger quality gates for trade execution handoff.
+# Trigger only when all legs are recently updated and internally coherent.
+WS_TRIGGER_MAX_AGE_MS  = int(os.getenv("WS_TRIGGER_MAX_AGE_MS", "1200"))
+WS_TRIGGER_MAX_SKEW_MS = int(os.getenv("WS_TRIGGER_MAX_SKEW_MS", "500"))
+
 # ── Expiry alerting ───────────────────────────────────────────────────────────
 EXPIRING_SOON_MINS             = int(os.getenv("EXPIRING_SOON_MINS", "30"))
 EXPIRING_ACTIONABLE_MIN_PROFIT = float(os.getenv("EXPIRING_ACTIONABLE_MIN_PROFIT", "0.01"))
@@ -130,6 +135,13 @@ MAX_LEG_DRIFT = float(os.getenv("MAX_LEG_DRIFT", "0.02"))
 
 # Seconds to wait for a fill confirmation before declaring timeout
 FILL_TIMEOUT_SECS = int(os.getenv("FILL_TIMEOUT_SECS", "10"))
+
+# Event-driven path uses WS snapshots; abort if snapshot is too old.
+SNAPSHOT_MAX_AGE_MS = int(os.getenv("SNAPSHOT_MAX_AGE_MS", "1200"))
+
+# When enabled, phase1 submits at ask + offset (capped at 0.99) to improve fill odds.
+AGGRESSIVE_ENTRY_ENABLED = os.getenv("AGGRESSIVE_ENTRY_ENABLED", "true").lower() == "true"
+PHASE1_ENTRY_OFFSET = float(os.getenv("PHASE1_ENTRY_OFFSET", "0.01"))
 
 # Seconds to pause before retrying leg B after Phase 2 failure
 UNWIND_RETRY_DELAY_SECS = int(os.getenv("UNWIND_RETRY_DELAY_SECS", "5"))

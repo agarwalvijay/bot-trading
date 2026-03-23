@@ -54,11 +54,14 @@ from config import (
     WS_ALERT_COOLDOWN_SECS,
     WS_FRESHNESS_SECS,
     WS_MIN_PROFIT_IMPROVEMENT,
+    WS_TRIGGER_MAX_AGE_MS,
+    WS_TRIGGER_MAX_SKEW_MS,
 )
 from db import (
     init_db, opportunity_count, save_opportunity, update_opportunity,
     load_markets_from_cache, save_markets_cache, markets_cache_count,
     get_authorized_market_keys, increment_ws_counter, increment_ws_watched_counter,
+    increment_metric_counter,
     is_market_authorized,
 )
 from trader import settle_loop, trading_loop
@@ -69,6 +72,8 @@ from market_key import canonical_market_key
 _trade_trigger = threading.Event()
 # market_keys pushed here get sorted to the front of the next trading tick.
 _trade_priority_ids: collections.deque = collections.deque(maxlen=20)
+_trade_priority_snapshots: dict[str, dict] = {}
+_trade_priority_snapshots_lock = threading.Lock()
 from fetcher import (
     KalshiWSClient,
     fetch_active_markets,
@@ -119,6 +124,7 @@ rest_state_lock = threading.Lock()
 ws_activity: dict[str, datetime] = {}
 ws_activity_lock = threading.Lock()
 ws_event_log: collections.deque = collections.deque()  # type: ignore[type-arg]
+ws_ticker_updated_ms: dict[str, int] = {}
 
 # Rolling-chunk REST pointer
 _rest_chunk_start: int = 0
@@ -990,6 +996,7 @@ def ws_event_loop(event_queue: queue.Queue, stop_event: threading.Event) -> None
             ticker = msg.get("market_ticker", "")
             if not ticker:
                 continue
+            now_ms = int(time.time() * 1000)
 
             now_ts = time.time()
             if now_ts - auth_keys_cache_ts >= 5.0:
@@ -1022,6 +1029,8 @@ def ws_event_loop(event_queue: queue.Queue, stop_event: threading.Event) -> None
                     entry["no_ask"]      = no_ask
                     entry["no_ask_size"] = float(msg.get("no_ask_size_fp") or msg.get("no_ask_size") or entry.get("no_ask_size", 0))
                 live_prices[ticker] = entry
+            with ws_activity_lock:
+                ws_ticker_updated_ms[ticker] = now_ms
 
             _check_ticker_market(ticker, source="WS")
 
@@ -1106,8 +1115,53 @@ def _check_ticker_market(ticker: str, source: str) -> None:
             result.get("outcome_tickers", []),
         )
         if market_key and is_market_authorized(market_key):
-            _trade_priority_ids.append(market_key)
-            _trade_trigger.set()  # wake trading loop immediately
+            snapshot = None
+            if source == "WS":
+                leg_tickers = result.get("outcome_tickers") or [m["ticker"] for m in event_markets]
+                now_ms = int(time.time() * 1000)
+                with ws_activity_lock:
+                    ts_vals = [ws_ticker_updated_ms.get(t) for t in leg_tickers]
+                if all(ts is not None for ts in ts_vals):
+                    max_age = max(now_ms - ts for ts in ts_vals)
+                    skew = max(ts_vals) - min(ts_vals)
+                    if max_age <= WS_TRIGGER_MAX_AGE_MS and skew <= WS_TRIGGER_MAX_SKEW_MS:
+                        legs = []
+                        with prices_lock:
+                            for lt in leg_tickers:
+                                lp = live_prices.get(lt, {})
+                                legs.append({
+                                    "ticker": lt,
+                                    "price": lp.get("yes_ask"),
+                                    "size": float(lp.get("yes_ask_size") or 0.0),
+                                    "updated_at_ms": ws_ticker_updated_ms.get(lt),
+                                })
+                        if all(l.get("price") is not None for l in legs):
+                            snapshot = {
+                                "market_key": market_key,
+                                "triggered_at_ms": now_ms,
+                                "legs": legs,
+                            }
+                    else:
+                        if max_age > WS_TRIGGER_MAX_AGE_MS:
+                            increment_metric_counter("ws_gate_reject_age")
+                        if skew > WS_TRIGGER_MAX_SKEW_MS:
+                            increment_metric_counter("ws_gate_reject_skew")
+                        logger.debug(
+                            "WS trade-gate skip market=%s max_age=%dms skew=%dms",
+                            market_key, max_age, skew,
+                        )
+                else:
+                    increment_metric_counter("ws_gate_reject_missing_ts")
+                    logger.debug("WS trade-gate skip market=%s missing leg timestamp", market_key)
+
+            if source != "WS" or snapshot is not None:
+                if source == "WS":
+                    increment_metric_counter("ws_gate_pass")
+                _trade_priority_ids.append(market_key)
+                if snapshot is not None:
+                    with _trade_priority_snapshots_lock:
+                        _trade_priority_snapshots[market_key] = snapshot
+                _trade_trigger.set()  # wake trading loop immediately
         mins = _minutes_to_close(result.get("close_time"))
         if mins is not None and mins < EXPIRING_SOON_MINS:
             if (5 <= mins < EXPIRING_SOON_MINS
@@ -1482,7 +1536,8 @@ def main() -> None:
     if TRADING_ENABLED:
         trade_thread = threading.Thread(
             target=trading_loop,
-            args=(stop_event, _trade_trigger, _trade_priority_ids),
+            args=(stop_event, _trade_trigger, _trade_priority_ids,
+                  _trade_priority_snapshots, _trade_priority_snapshots_lock),
             daemon=True,
             name="trading-loop",
         )
