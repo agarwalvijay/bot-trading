@@ -12,6 +12,13 @@ load_dotenv()
 KALSHI_BASE_URL = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2")
 KALSHI_WS_URL   = os.getenv("KALSHI_WS_URL",   "wss://api.elections.kalshi.com/trade-api/ws/v2")
 
+# ── Polymarket public endpoints ──────────────────────────────────────────────
+POLY_GAMMA_BASE_URL = os.getenv("POLY_GAMMA_BASE_URL", "https://gamma-api.polymarket.com")
+POLY_GAMMA_MARKETS_PATH = os.getenv("POLY_GAMMA_MARKETS_PATH", "/markets")
+POLY_CLOB_BASE_URL = os.getenv("POLY_CLOB_BASE_URL", "https://clob.polymarket.com")
+POLY_GAMMA_PAGE_SIZE = int(os.getenv("POLY_GAMMA_PAGE_SIZE", "500"))
+POLY_GAMMA_SORT_FIELD = os.getenv("POLY_GAMMA_SORT_FIELD", "volume24hr")
+
 # ── Kalshi API credentials ────────────────────────────────────────────────────
 # Generate via Account Settings → API Keys on kalshi.com
 # The private key PEM file is generated locally — Kalshi never stores it.
@@ -59,6 +66,8 @@ NEAR_TERM_HORIZON_HOURS  = float(os.getenv("NEAR_TERM_HORIZON_HOURS", "12"))
 # Taker fee per contract = TAKER_FEE_COEFF × price × (1 − price)
 # At $0.50 this equals 1.75¢/contract; approaches 0 near $0.01 or $0.99.
 TAKER_FEE_COEFF = float(os.getenv("TAKER_FEE_COEFF", "0.07"))
+# Approximate Polymarket taker fee used for cross-venue comparison.
+POLY_TAKER_FEE_RATE = float(os.getenv("POLY_TAKER_FEE_RATE", "0.02"))
 
 # ── Arbitrage filters ─────────────────────────────────────────────────────────
 # Minimum net profit (after fees) as a fraction to surface an opportunity
