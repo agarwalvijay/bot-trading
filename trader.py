@@ -50,13 +50,15 @@ from config import (
     UNWIND_RETRY_DELAY_SECS,
 )
 from db import (
+    create_trade_attempt,
     create_trade,
     get_authorized_opportunities,
     get_complete_trades,
     get_trade,
+    mark_market_success,
     mark_likely_resolved,
-    set_authorized,
     stamp_trader_invoked,
+    update_trade_attempt,
     update_trade,
 )
 from fetcher import cancel_order, fetch_market_prices, get_order, get_order_fills, place_order
@@ -325,7 +327,7 @@ def _unwind(trade_id: int, filled_legs: list[dict]) -> None:
 # Core execution
 # ---------------------------------------------------------------------------
 
-def execute_trade(opp: dict, event_driven: bool = False) -> None:
+def execute_trade(opp: dict, event_driven: bool = False) -> bool:
     """
     Execute a two-phase arb trade for an authorized opportunity.
     All state is written to the trades table.
@@ -336,8 +338,14 @@ def execute_trade(opp: dict, event_driven: bool = False) -> None:
                   not routine poll retries).
     """
     opp_id = opp["id"]
+    market_key = opp.get("market_key") or opp.get("ticker")
     mode   = "DEMO" if DEMO_MODE else "LIVE"
     logger.info("=== TRADE START [%s] opp_id=%d  %s ===", mode, opp_id, opp.get("title", ""))
+    attempt_id = create_trade_attempt(
+        opp_id,
+        market_key or "",
+        "event" if event_driven else "poll",
+    ) if event_driven else 0
     if event_driven:
         stamp_trader_invoked(opp_id)
 
@@ -353,6 +361,13 @@ def execute_trade(opp: dict, event_driven: bool = False) -> None:
         else:
             # Transient failure (prices momentarily unavailable) — leave authorized, retry next tick
             logger.info("Preflight failed (opp_id=%d): %s — will retry", opp_id, abort_reason)
+        update_trade_attempt(
+            attempt_id,
+            preflight_ok=0,
+            preflight_reason=abort_reason or "unknown_preflight_failure",
+            order_attempted=0,
+            final_status="preflight_failed",
+        )
         return False  # preflight failed — caller may try next authorized opp
 
     legs      = verified["legs"]
@@ -364,6 +379,12 @@ def execute_trade(opp: dict, event_driven: bool = False) -> None:
     trade_id = create_trade(opp_id, leg_tickers, [count] * len(legs),
                             target_prices, coids, DEMO_MODE)
     logger.info("Trade record created: trade_id=%d", trade_id)
+    update_trade_attempt(
+        attempt_id,
+        preflight_ok=1,
+        preflight_reason=None,
+        trade_id=trade_id,
+    )
 
     filled_legs  = []   # legs successfully filled (for unwind if needed)
     order_ids    = []
@@ -387,7 +408,13 @@ def execute_trade(opp: dict, event_driven: bool = False) -> None:
         update_trade(trade_id, status="aborted",
                      notes=f"phase1_place_error: {exc}",
                      completed_at=datetime.now(timezone.utc).isoformat())
-        return
+        update_trade_attempt(
+            attempt_id,
+            order_attempted=0,
+            final_status="phase1_place_error",
+            preflight_reason=f"phase1_place_error: {exc}",
+        )
+        return False
 
     filled1 = _wait_for_fill(oid1, FILL_TIMEOUT_SECS)
     if not filled1 or filled1.get("filled_count", 0) == 0:
@@ -395,6 +422,13 @@ def execute_trade(opp: dict, event_driven: bool = False) -> None:
         update_trade(trade_id, status="aborted",
                      notes="phase1_timeout",
                      completed_at=datetime.now(timezone.utc).isoformat())
+        update_trade_attempt(
+            attempt_id,
+            order_attempted=1,
+            first_order_id=oid1,
+            final_status="phase1_timeout",
+            preflight_reason="phase1_timeout",
+        )
         return True  # trade was attempted
 
     actual_count = filled1.get("filled_count", count)
@@ -409,6 +443,16 @@ def execute_trade(opp: dict, event_driven: bool = False) -> None:
                  status="phase1_filled",
                  fill_prices=json.dumps(fill_prices),
                  fill_counts=json.dumps(fill_counts))
+    update_trade_attempt(
+        attempt_id,
+        order_attempted=1,
+        first_order_id=oid1,
+        final_status="phase1_filled",
+    )
+
+    # First fully filled order marks market-level success (stop future retries).
+    if actual_count >= count and market_key:
+        mark_market_success(market_key, trade_id, oid1)
 
     # ── Phase 2+: remaining legs (simultaneous placement, parallel fill wait) ─
     phase2_failed = []
@@ -519,6 +563,7 @@ def execute_trade(opp: dict, event_driven: bool = False) -> None:
                          completed_at=datetime.now(timezone.utc).isoformat(),
                          fill_prices=json.dumps(fill_prices),
                          fill_counts=json.dumps(fill_counts))
+            update_trade_attempt(attempt_id, final_status="unwind")
             return True  # trade was attempted
 
     # ── ARB COMPLETE ─────────────────────────────────────────────────────────
@@ -544,6 +589,7 @@ def execute_trade(opp: dict, event_driven: bool = False) -> None:
         "gross=+$%.4f  fees=-$%.4f  net=+$%.4f ===",
         mode, trade_id, actual_count, gross_pnl, fee_pnl, net_pnl,
     )
+    update_trade_attempt(attempt_id, final_status="complete")
     return True  # trade was attempted
 
 
@@ -560,7 +606,7 @@ def trading_loop(stop_event: threading.Event,
 
     trade_trigger: optional Event set by WS/REST handlers when a fresh arb is
     detected. Wakes the loop immediately rather than waiting TRADE_POLL_INTERVAL.
-    priority_ids: optional deque of opp_ids to try first this tick.
+    priority_ids: optional deque of market_keys to try first this tick.
     """
     if not TRADING_ENABLED:
         logger.info("Trading disabled (TRADING_ENABLED=false) — trading loop not running")
@@ -569,14 +615,14 @@ def trading_loop(stop_event: threading.Event,
     mode = "DEMO" if DEMO_MODE else "LIVE"
     logger.info("Trading loop started [%s]", mode)
 
-    # First run is treated as event-driven (handles authorized opps present at startup)
-    triggered = True
+    # Startup scan is a poll/backstop pass; only real trigger wakeups are event-driven.
+    triggered = False
 
     while not stop_event.is_set():
         try:
             opps = get_authorized_opportunities()
             if opps:
-                # Drain priority deque — sort triggered opp(s) to front
+                # Drain priority deque — sort triggered market(s) to front
                 pri: set = set()
                 if priority_ids:
                     while True:
@@ -584,7 +630,7 @@ def trading_loop(stop_event: threading.Event,
                             pri.add(priority_ids.popleft())
                         except IndexError:
                             break
-                    opps.sort(key=lambda o: 0 if o["id"] in pri else 1)
+                    opps.sort(key=lambda o: 0 if (o.get("market_key") or o.get("ticker")) in pri else 1)
 
                 logger.info("Trading loop: %d authorized opportunity/ies [%s]",
                             len(opps), "event" if triggered else "poll")  # noqa: F821
@@ -724,7 +770,7 @@ def _try_settle(trade: dict) -> None:
         except Exception as exc:
             logger.error("Settle sell failed for %s: %s — aborting settle", ticker, exc)
             # Cancel already-placed sells to avoid partial exit
-            for _, _, placed_oid in sell_orders:
+            for _, _, _, placed_oid in sell_orders:
                 try:
                     cancel_order(placed_oid)
                 except Exception:

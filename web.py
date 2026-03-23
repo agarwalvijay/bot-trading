@@ -17,7 +17,9 @@ from datetime import datetime, timezone
 from flask import Flask, render_template_string, request, redirect, url_for, jsonify
 
 from config import DB_PATH, DEMO_MODE, MIN_VOLUME_24H, TAKER_FEE_COEFF, TRADING_ENABLED
+from db import set_authorized
 from fetcher import fetch_market_prices
+from market_key import canonical_market_key
 
 app = Flask(__name__)
 
@@ -39,8 +41,11 @@ TEMPLATE = """<!doctype html>
     .profit-neg  { color: #6c757d; }
     td.legs      { font-size: 0.78rem; line-height: 1.6; white-space: nowrap; }
     .q           { max-width: 380px; word-break: break-word; }
-    .stat-card   { min-width: 130px; }
+    .stat-card   { min-width: 112px; }
     tr.authorized-row { background: #f0fff4 !important; }
+    a.card-link { text-decoration: none; color: inherit; display: inline-block; }
+    .stat-card.active-filter { border: 2px solid #0d6efd; }
+    .stats-row { flex-wrap: nowrap; overflow-x: auto; }
   </style>
 </head>
 <body>
@@ -54,138 +59,139 @@ TEMPLATE = """<!doctype html>
       <button class="btn btn-sm btn-link text-muted p-0" onclick="location.reload()" title="Refresh now">&#8635;</button>
       <form method="post" action="/clear" onsubmit="return confirm('Clear {{ category.replace(\"_\", \" \").title() + \" opportunities\" if category else \"ALL logged opportunities\" }}? This cannot be undone.');">
         <input type="hidden" name="cat" value="{{ category }}">
+        <input type="hidden" name="view" value="{{ view_mode }}">
         <button type="submit" class="btn btn-sm btn-outline-danger">Clear {{ category.replace("_", " ").title() if category else "All" }}</button>
       </form>
     </div>
   </div>
 
   <!-- Stats row -->
-  <div class="row g-2 mb-3">
+  <div class="row g-1 mb-3 stats-row">
     <div class="col-auto">
-      <div class="card stat-card text-center px-3 py-2">
+      <a class="card-link" href="/?view={{ view_mode }}">
+      <div class="card stat-card text-center px-2 py-1 {{ 'active-filter' if not category }}">
         <div class="text-muted small">Total logged</div>
-        <div class="fs-5 fw-bold">{{ stats.total }}</div>
+        <div class="fs-6 fw-bold">{{ stats.total }}</div>
       </div>
+      </a>
     </div>
     <div class="col-auto">
-      <div class="card stat-card text-center px-3 py-2">
+      <a class="card-link" href="/?cat=opportunity&view={{ view_mode }}">
+      <div class="card stat-card text-center px-2 py-1 {{ 'active-filter' if category == 'opportunity' }}">
         <div class="text-muted small">Opportunities</div>
-        <div class="fs-5 fw-bold text-success">{{ stats.opps }}</div>
+        <div class="fs-6 fw-bold text-success">{{ stats.opps }}</div>
       </div>
+      </a>
     </div>
     <div class="col-auto">
-      <div class="card stat-card text-center px-3 py-2">
+      <a class="card-link" href="/?cat=near_miss&view={{ view_mode }}">
+      <div class="card stat-card text-center px-2 py-1 {{ 'active-filter' if category == 'near_miss' }}">
         <div class="text-muted small">Near misses</div>
-        <div class="fs-5 fw-bold text-warning">{{ stats.near_miss }}</div>
+        <div class="fs-6 fw-bold text-warning">{{ stats.near_miss }}</div>
       </div>
+      </a>
     </div>
     <div class="col-auto">
-      <div class="card stat-card text-center px-3 py-2">
+      <a class="card-link" href="/?cat=cumulative&view={{ view_mode }}">
+      <div class="card stat-card text-center px-2 py-1 {{ 'active-filter' if category == 'cumulative' }}">
         <div class="text-muted small">Cumulative</div>
-        <div class="fs-5 fw-bold text-danger">{{ stats.cumulative }}</div>
+        <div class="fs-6 fw-bold text-danger">{{ stats.cumulative }}</div>
       </div>
+      </a>
     </div>
     <div class="col-auto">
-      <div class="card stat-card text-center px-3 py-2">
+      <a class="card-link" href="/?cat=non_exhaustive&view={{ view_mode }}">
+      <div class="card stat-card text-center px-2 py-1 {{ 'active-filter' if category == 'non_exhaustive' }}">
         <div class="text-muted small">Non-exhaustive</div>
-        <div class="fs-5 fw-bold" style="color:#6f42c1">{{ stats.non_exhaustive }}</div>
+        <div class="fs-6 fw-bold" style="color:#6f42c1">{{ stats.non_exhaustive }}</div>
       </div>
+      </a>
     </div>
     <div class="col-auto">
-      <div class="card stat-card text-center px-3 py-2">
+      <a class="card-link" href="/?cat=spread_market&view={{ view_mode }}">
+      <div class="card stat-card text-center px-2 py-1 {{ 'active-filter' if category == 'spread_market' }}">
         <div class="text-muted small">Spread</div>
-        <div class="fs-5 fw-bold" style="color:#0d6efd">{{ stats.spread_market }}</div>
+        <div class="fs-6 fw-bold" style="color:#0d6efd">{{ stats.spread_market }}</div>
       </div>
+      </a>
     </div>
     <div class="col-auto">
-      <div class="card stat-card text-center px-3 py-2">
+      <a class="card-link" href="/?cat=likely_resolved&view={{ view_mode }}">
+      <div class="card stat-card text-center px-2 py-1 {{ 'active-filter' if category == 'likely_resolved' }}">
         <div class="text-muted small">Likely resolved</div>
-        <div class="fs-5 fw-bold" style="color:#6c3483">{{ stats.likely_resolved }}</div>
+        <div class="fs-6 fw-bold" style="color:#6c3483">{{ stats.likely_resolved }}</div>
       </div>
+      </a>
     </div>
     <div class="col-auto">
-      <div class="card stat-card text-center px-3 py-2">
+      <a class="card-link" href="/?cat=ignored&view={{ view_mode }}">
+      <div class="card stat-card text-center px-2 py-1 {{ 'active-filter' if category == 'ignored' }}">
         <div class="text-muted small">Ignored</div>
-        <div class="fs-5 fw-bold text-muted">{{ stats.ignored }}</div>
+        <div class="fs-6 fw-bold text-muted">{{ stats.ignored }}</div>
       </div>
+      </a>
     </div>
     <div class="col-auto">
-      <div class="card stat-card text-center px-3 py-2">
+      <div class="card stat-card text-center px-2 py-1">
         <div class="text-muted small">Last logged</div>
-        <div class="fs-5 fw-bold">{{ stats.last_seen_ago }}</div>
+        <div class="fs-6 fw-bold">{{ stats.last_seen_ago }}</div>
       </div>
     </div>
     <div class="col-auto">
-      <div class="card stat-card text-center px-3 py-2">
-        <div class="text-muted small">Markets tracked</div>
-        <div class="fs-5 fw-bold text-info">{{ stats.tracked_markets }}</div>
-      </div>
-    </div>
-    <div class="col-auto">
-      <div class="card stat-card text-center px-3 py-2">
+      <div class="card stat-card text-center px-2 py-1">
         <div class="text-muted small">Min 24h vol</div>
-        <div class="fs-5 fw-bold text-secondary">{{ stats.min_volume_24h }}</div>
+        <div class="fs-6 fw-bold text-secondary">{{ stats.min_volume_24h }}</div>
+      </div>
+    </div>
+    <div class="col-auto">
+      <div class="card stat-card text-center px-2 py-1">
+        <div class="text-muted small">WS notifications</div>
+        <div class="fs-6 fw-bold text-primary">{{ stats.ws_count }}</div>
+        <div class="text-muted small">since {{ stats.ws_since }}</div>
       </div>
     </div>
   </div>
 
-  <!-- Filter tabs -->
-  <ul class="nav nav-tabs mb-0">
-    <li class="nav-item">
-      <a class="nav-link {{ 'active fw-semibold' if not category }}" href="/">All</a>
-    </li>
-    <li class="nav-item">
-      <a class="nav-link {{ 'active fw-semibold' if category == 'opportunity' }}"
-         href="/?cat=opportunity">Opportunities</a>
-    </li>
-    <li class="nav-item">
-      <a class="nav-link {{ 'active fw-semibold' if category == 'near_miss' }}"
-         href="/?cat=near_miss">Near misses</a>
-    </li>
-    <li class="nav-item">
-      <a class="nav-link {{ 'active fw-semibold' if category == 'cumulative' }}"
-         href="/?cat=cumulative">Cumulative</a>
-    </li>
-    <li class="nav-item">
-      <a class="nav-link {{ 'active fw-semibold' if category == 'non_exhaustive' }}"
-         href="/?cat=non_exhaustive">Non-exhaustive</a>
-    </li>
-    <li class="nav-item">
-      <a class="nav-link {{ 'active fw-semibold' if category == 'spread_market' }}"
-         href="/?cat=spread_market">Spread</a>
-    </li>
-    <li class="nav-item">
-      <a class="nav-link {{ 'active fw-semibold' if category == 'likely_resolved' }}"
-         href="/?cat=likely_resolved">Likely resolved</a>
-    </li>
-    <li class="nav-item">
-      <a class="nav-link {{ 'active fw-semibold' if category == 'ignored' }}"
-         href="/?cat=ignored">Ignored</a>
-    </li>
-    <li class="nav-item ms-auto d-flex align-items-center pe-2">
-      <form method="post" action="/add-market" class="d-flex gap-1 align-items-center">
-        <input type="hidden" name="cat" value="{{ category }}">
-        <input type="text" name="ticker" placeholder="Add ticker…"
-               class="form-control form-control-sm" style="width:210px"
-               title="Enter an event ticker (e.g. KXNHLGAME-26MAR21WPGPIT) or market ticker">
-        <button type="submit" class="btn btn-sm btn-outline-secondary">+ Watch</button>
-      </form>
-    </li>
-    {% if trading_enabled %}
-    <li class="nav-item d-flex align-items-center">
-      <a class="nav-link text-success fw-semibold" href="/authorized">&#9889; Authorized</a>
-    </li>
-    <li class="nav-item d-flex align-items-center">
-      <a class="nav-link text-success fw-semibold" href="/trades">&#128200; Trades</a>
-    </li>
-    {% endif %}
-  </ul>
+  <div class="d-flex justify-content-between align-items-center mb-2">
+    <form method="post" action="/add-market" class="d-flex gap-1 align-items-center">
+      <input type="hidden" name="cat" value="{{ category }}">
+      <input type="hidden" name="view" value="{{ view_mode }}">
+      <input type="text" name="ticker" placeholder="Add ticker…"
+             class="form-control form-control-sm" style="width:210px"
+             title="Enter an event ticker (e.g. KXNHLGAME-26MAR21WPGPIT) or market ticker">
+      <button type="submit" class="btn btn-sm btn-outline-secondary">+ Watch</button>
+    </form>
+    <div class="d-flex align-items-center gap-2">
+      <a class="btn btn-sm {{ 'btn-primary' if view_mode == 'time' else 'btn-outline-primary' }}"
+         href="/?cat={{ category }}&view=time">Time</a>
+      <a class="btn btn-sm {{ 'btn-primary' if view_mode == 'market' else 'btn-outline-primary' }}"
+         href="/?cat={{ category }}&view=market">Market</a>
+      {% if trading_enabled %}
+      <a class="btn btn-sm btn-outline-success" href="/authorized">&#9889; Authorized</a>
+      <a class="btn btn-sm btn-outline-success" href="/trades">&#128200; Trades</a>
+      <a class="btn btn-sm btn-outline-success" href="/attempts">&#128269; Attempts</a>
+      {% endif %}
+    </div>
+  </div>
 
   <!-- Table -->
   <div class="card rounded-top-0 border-top-0">
     <div class="table-responsive">
       <table class="table table-sm table-hover align-middle mb-0">
         <thead class="table-dark">
+          {% if view_mode == 'market' %}
+          <tr>
+            <th style="width:90px">Last Seen</th>
+            <th>Market</th>
+            <th style="width:70px">Alerts</th>
+            <th style="width:95px">Latest net</th>
+            <th style="width:95px">Best net</th>
+            <th style="width:70px">Vol 24h</th>
+            <th style="width:90px">Sources</th>
+            <th style="width:90px">Trade</th>
+            <th style="width:52px"></th>
+          </tr>
+          {% else %}
           <tr>
             <th style="width:80px">Time</th>
             <th>Market</th>
@@ -197,8 +203,144 @@ TEMPLATE = """<!doctype html>
             <th style="width:90px">Trade</th>
             <th style="width:52px"></th>
           </tr>
+          {% endif %}
         </thead>
         <tbody>
+          {% if view_mode == 'market' %}
+          {% for r in rows %}
+          <tr class="{{ 'authorized-row' if r.authorized }}">
+            <td class="text-muted text-nowrap">{{ r.time_ago }}</td>
+            <td class="q">
+              <a href="{{ r.kalshi_url }}" target="_blank" rel="noopener"
+                 class="text-decoration-none text-dark">{{ r.question }}</a>
+              {% if r.closes_in.label %}
+                <br><span class="small {{ r.closes_in.css }}">{{ r.closes_in.label }}</span>
+              {% endif %}
+              {% if r.authorized %}
+                <br><span class="badge bg-success">&#9889; AUTHORIZED</span>
+              {% endif %}
+            </td>
+            <td class="text-muted text-nowrap">
+              {{ r.count }}
+              <button class="btn btn-sm btn-link text-dark p-0 ms-1" type="button"
+                      title="Show alerts" data-bs-toggle="collapse"
+                      data-bs-target="#alerts-{{ r.row_id }}" aria-expanded="false"
+                      aria-controls="alerts-{{ r.row_id }}">+</button>
+            </td>
+            <td class="{{ 'profit-pos' if r.latest_net_profit >= 0.005 else ('profit-near' if r.latest_net_profit >= 0 else 'profit-neg') }}">
+              {{ "%+.3f%%" | format(r.latest_net_profit * 100) }}
+            </td>
+            <td class="{{ 'profit-pos' if r.best_net_profit >= 0.005 else ('profit-near' if r.best_net_profit >= 0 else 'profit-neg') }}">
+              {{ "%+.3f%%" | format(r.best_net_profit * 100) }}
+            </td>
+            <td class="text-muted text-nowrap">
+              {% if r.volume_24h %}{{ "%.0f" | format(r.volume_24h) }}{% else %}—{% endif %}
+            </td>
+            <td>
+              {% for s in r.sources %}
+                <span class="badge {{ 'bg-info text-dark' if s == 'WS' else 'bg-secondary' }}">{{ s }}</span>
+              {% endfor %}
+            </td>
+            <td class="text-nowrap">
+              {% if r.trade_id %}
+                {% if r.trade_status == 'complete' %}
+                  <a href="/trades" class="badge bg-success text-decoration-none">&#10003; complete</a>
+                {% elif r.trade_status in ('phase1_placed', 'phase2_placed', 'pending') %}
+                  <a href="/trades" class="badge bg-warning text-dark text-decoration-none">&#8635; in progress</a>
+                {% elif r.trade_status in ('unwind_retry', 'unwind_limit', 'unwind_market', 'unwind_hold') %}
+                  <a href="/trades" class="badge bg-warning text-dark text-decoration-none">&#9100; unwinding</a>
+                {% elif r.trade_status == 'aborted' %}
+                  <a href="/trades" class="badge bg-danger text-decoration-none">&#10007; aborted</a>
+                {% else %}
+                  <a href="/trades" class="badge bg-primary text-decoration-none">attempted</a>
+                {% endif %}
+              {% elif r.trader_invoked_at %}
+                <span class="badge bg-secondary">preflight fail</span>
+              {% else %}
+                <span class="text-muted">—</span>
+              {% endif %}
+            </td>
+            <td class="text-nowrap">
+              <button class="btn btn-sm btn-link text-primary p-0 me-1" title="Live prices"
+                      onclick="showLive({{ r.row_id }})">&#8635;</button>
+              {% if trading_enabled and category == 'opportunity' %}
+                {% if r.authorized %}
+                <form method="post" action="/authorize/{{ r.row_id }}" style="margin:0;display:inline">
+                  <input type="hidden" name="cat" value="{{ category }}">
+                  <input type="hidden" name="view" value="{{ view_mode }}">
+                  <input type="hidden" name="authorize" value="0">
+                  <button type="submit" class="btn btn-sm btn-link text-success p-0 me-1"
+                          title="Deauthorize trade" style="font-size:1rem">&#9889;</button>
+                </form>
+                {% else %}
+                <form method="post" action="/authorize/{{ r.row_id }}" style="margin:0;display:inline">
+                  <input type="hidden" name="cat" value="{{ category }}">
+                  <input type="hidden" name="view" value="{{ view_mode }}">
+                  <input type="hidden" name="authorize" value="1">
+                  <button type="submit" class="btn btn-sm btn-link text-muted p-0 me-1"
+                          title="Authorize for trading" style="font-size:1rem">&#9889;</button>
+                </form>
+                {% endif %}
+              {% endif %}
+              {% if r.latest_category != 'opportunity' %}
+              <form method="post" action="/set-category/{{ r.row_id }}" style="margin:0;display:inline">
+                <input type="hidden" name="cat" value="{{ category }}">
+                <input type="hidden" name="view" value="{{ view_mode }}">
+                <input type="hidden" name="new_cat" value="opportunity">
+                <button type="submit" class="btn btn-sm btn-link text-success p-0 me-1" title="Promote to opportunity">&#8679;</button>
+              </form>
+              {% endif %}
+              {% if r.latest_category != 'ignored' %}
+              <form method="post" action="/set-category/{{ r.row_id }}" style="margin:0;display:inline">
+                <input type="hidden" name="cat" value="{{ category }}">
+                <input type="hidden" name="view" value="{{ view_mode }}">
+                <input type="hidden" name="new_cat" value="ignored">
+                <button type="submit" class="btn btn-sm btn-link text-secondary p-0 me-1" title="Ignore">&#8856;</button>
+              </form>
+              {% endif %}
+              <form method="post" action="/delete/{{ r.row_id }}" style="margin:0;display:inline"
+                    onsubmit="return confirm('Delete this row?');">
+                <input type="hidden" name="cat" value="{{ category }}">
+                <input type="hidden" name="view" value="{{ view_mode }}">
+                <button type="submit" class="btn btn-sm btn-link text-danger p-0" title="Delete">&times;</button>
+              </form>
+            </td>
+          </tr>
+          <tr class="collapse" id="alerts-{{ r.row_id }}">
+            <td colspan="9" class="bg-light">
+              <div class="small text-muted mb-2">All alerts for this market (newest first)</div>
+              <div class="table-responsive">
+                <table class="table table-sm mb-0">
+                  <thead>
+                    <tr>
+                      <th style="width:70px">Time</th>
+                      <th style="width:120px">Category</th>
+                      <th style="width:90px">Net</th>
+                      <th style="width:80px">Sum asks</th>
+                      <th style="width:70px">Src</th>
+                      <th style="width:70px">Vol</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for a in r.alerts %}
+                    <tr>
+                      <td class="text-muted">{{ a.time_ago }}</td>
+                      <td>{{ a.category }}</td>
+                      <td class="{{ 'profit-pos' if a.net_profit >= 0.005 else ('profit-near' if a.net_profit >= 0 else 'profit-neg') }}">
+                        {{ "%+.3f%%" | format(a.net_profit * 100) }}
+                      </td>
+                      <td>{{ "%.4f" | format(a.sum_asks) }}</td>
+                      <td>{{ a.source }}</td>
+                      <td class="text-muted">{% if a.volume_24h %}{{ "%.0f" | format(a.volume_24h) }}{% else %}—{% endif %}</td>
+                    </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+          {% else %}
           {% for r in rows %}
           <tr class="{{ 'authorized-row' if r.authorized }}">
             <td class="text-muted text-nowrap">{{ r.time_ago }}</td>
@@ -231,15 +373,16 @@ TEMPLATE = """<!doctype html>
               {% endif %}
             </td>
             <td class="legs">
-              {% for leg in r.legs[:10] %}
+              {% set legs = r.legs | default([]) %}
+              {% for leg in legs[:10] %}
               <div>
                 <span class="text-muted">{{ leg.outcome[:18] }}</span>
                 ask=<strong>{{ "%.4f" | format(leg.price) }}</strong>
                 <span class="text-muted">({{ "%.0f" | format(leg.size) }})</span>
               </div>
               {% endfor %}
-              {% if r.legs | length > 10 %}
-              <div class="text-muted">…and {{ r.legs | length - 10 }} more</div>
+              {% if legs | length > 10 %}
+              <div class="text-muted">…and {{ legs | length - 10 }} more</div>
               {% endif %}
             </td>
             <td>{{ "%.4f" | format(r.sum_asks) }}</td>
@@ -284,6 +427,7 @@ TEMPLATE = """<!doctype html>
                 {% if r.authorized %}
                 <form method="post" action="/authorize/{{ r.row_id }}" style="margin:0;display:inline">
                   <input type="hidden" name="cat" value="{{ category }}">
+                  <input type="hidden" name="view" value="{{ view_mode }}">
                   <input type="hidden" name="authorize" value="0">
                   <button type="submit" class="btn btn-sm btn-link text-success p-0 me-1"
                           title="Deauthorize trade" style="font-size:1rem">&#9889;</button>
@@ -291,6 +435,7 @@ TEMPLATE = """<!doctype html>
                 {% else %}
                 <form method="post" action="/authorize/{{ r.row_id }}" style="margin:0;display:inline">
                   <input type="hidden" name="cat" value="{{ category }}">
+                  <input type="hidden" name="view" value="{{ view_mode }}">
                   <input type="hidden" name="authorize" value="1">
                   <button type="submit" class="btn btn-sm btn-link text-muted p-0 me-1"
                           title="Authorize for trading" style="font-size:1rem">&#9889;</button>
@@ -300,6 +445,7 @@ TEMPLATE = """<!doctype html>
               {% if r.category != 'opportunity' %}
               <form method="post" action="/set-category/{{ r.row_id }}" style="margin:0;display:inline">
                 <input type="hidden" name="cat" value="{{ category }}">
+                <input type="hidden" name="view" value="{{ view_mode }}">
                 <input type="hidden" name="new_cat" value="opportunity">
                 <button type="submit" class="btn btn-sm btn-link text-success p-0 me-1" title="Promote to opportunity">&#8679;</button>
               </form>
@@ -307,6 +453,7 @@ TEMPLATE = """<!doctype html>
               {% if r.category != 'ignored' %}
               <form method="post" action="/set-category/{{ r.row_id }}" style="margin:0;display:inline">
                 <input type="hidden" name="cat" value="{{ category }}">
+                <input type="hidden" name="view" value="{{ view_mode }}">
                 <input type="hidden" name="new_cat" value="ignored">
                 <button type="submit" class="btn btn-sm btn-link text-secondary p-0 me-1" title="Ignore">&#8856;</button>
               </form>
@@ -314,14 +461,16 @@ TEMPLATE = """<!doctype html>
               <form method="post" action="/delete/{{ r.row_id }}" style="margin:0;display:inline"
                     onsubmit="return confirm('Delete this row?');">
                 <input type="hidden" name="cat" value="{{ category }}">
+                <input type="hidden" name="view" value="{{ view_mode }}">
                 <button type="submit" class="btn btn-sm btn-link text-danger p-0" title="Delete">&times;</button>
               </form>
             </td>
           </tr>
           {% endfor %}
+          {% endif %}
           {% if not rows %}
           <tr>
-            <td colspan="7" class="text-center text-muted py-5">No records yet.</td>
+            <td colspan="9" class="text-center text-muted py-5">No records yet.</td>
           </tr>
           {% endif %}
         </tbody>
@@ -480,6 +629,9 @@ _TRADING_NAV = """
     </li>
     <li class="nav-item">
       <a class="nav-link {{ 'active fw-semibold' if active_tab == 'trades' }}" href="/trades">&#128200; Trades</a>
+    </li>
+    <li class="nav-item">
+      <a class="nav-link {{ 'active fw-semibold' if active_tab == 'attempts' }}" href="/attempts">&#128269; Attempts</a>
     </li>
   </ul>
 """
@@ -767,6 +919,137 @@ setTimeout(function() { location.reload(); }, 10000);
 </body>
 </html>"""
 
+ATTEMPTS_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kalshi Arb — Attempts</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { font-size: 0.875rem; background: #f8f9fa; }
+    .stat-card { min-width: 130px; }
+    td.small-mono { font-size: 0.78rem; font-family: monospace; }
+  </style>
+</head>
+<body>
+<div class="container-fluid py-3 px-4">
+  """ + _TRADING_NAV + """
+  <div class="d-flex justify-content-end align-items-center mb-2">
+    <form method="post" action="/clear-attempts"
+          onsubmit="return confirm('Clear ALL event-driven attempts? This cannot be undone.');">
+      <button type="submit" class="btn btn-sm btn-outline-danger">Clear All Attempts</button>
+    </form>
+  </div>
+  <div class="row g-2 mb-3">
+    <div class="col-auto">
+      <div class="card stat-card text-center px-3 py-2">
+        <div class="text-muted small">Event kicks</div>
+        <div class="fs-5 fw-bold">{{ stats.total }}</div>
+      </div>
+    </div>
+    <div class="col-auto">
+      <div class="card stat-card text-center px-3 py-2">
+        <div class="text-muted small">Preflight failed</div>
+        <div class="fs-5 fw-bold text-danger">{{ stats.preflight_failed }}</div>
+      </div>
+    </div>
+    <div class="col-auto">
+      <div class="card stat-card text-center px-3 py-2">
+        <div class="text-muted small">Order attempted</div>
+        <div class="fs-5 fw-bold text-warning">{{ stats.order_attempted }}</div>
+      </div>
+    </div>
+    <div class="col-auto">
+      <div class="card stat-card text-center px-3 py-2">
+        <div class="text-muted small">Completed</div>
+        <div class="fs-5 fw-bold text-success">{{ stats.complete }}</div>
+      </div>
+    </div>
+  </div>
+  <div class="card mb-3">
+    <div class="card-header py-2 fw-semibold">Top preflight reasons</div>
+    <div class="card-body py-2">
+      {% if reasons %}
+        {% for r in reasons %}
+          <span class="badge bg-secondary me-2 mb-2">{{ r.reason }} ({{ r.n }})</span>
+        {% endfor %}
+      {% else %}
+        <span class="text-muted">No preflight failures logged.</span>
+      {% endif %}
+    </div>
+  </div>
+  <div class="card">
+    <div class="table-responsive">
+      <table class="table table-sm table-hover align-middle mb-0">
+        <thead class="table-dark">
+          <tr>
+            <th style="width:60px">#</th>
+            <th style="width:90px">When</th>
+            <th>Market</th>
+            <th style="width:110px">Preflight</th>
+            <th style="width:100px">Order?</th>
+            <th style="width:160px">Reason</th>
+            <th style="width:120px">Final status</th>
+            <th style="width:70px">Trade</th>
+            <th style="width:52px"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for a in attempts %}
+          <tr>
+            <td class="text-muted">{{ a.id }}</td>
+            <td class="text-muted text-nowrap">{{ a.when }}</td>
+            <td>
+              {% if a.kalshi_url %}
+                <a href="{{ a.kalshi_url }}" target="_blank" rel="noopener"
+                   class="text-decoration-none text-dark">{{ a.market_title or a.market_key }}</a>
+              {% else %}{{ a.market_title or a.market_key }}{% endif %}
+              {% if a.market_key %}
+              <div class="text-muted small">{{ a.market_key }}</div>
+              {% endif %}
+            </td>
+            <td>
+              {% if a.preflight_ok == 1 %}
+                <span class="badge bg-success">ok</span>
+              {% elif a.preflight_ok == 0 %}
+                <span class="badge bg-danger">failed</span>
+              {% else %}
+                <span class="badge bg-secondary">n/a</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if a.order_attempted %}
+                <span class="badge bg-warning text-dark">yes</span>
+              {% else %}
+                <span class="badge bg-secondary">no</span>
+              {% endif %}
+            </td>
+            <td class="text-muted">{{ a.preflight_reason or "—" }}</td>
+            <td>{{ a.final_status or "—" }}</td>
+            <td class="text-muted">{{ a.trade_id or "—" }}</td>
+            <td class="text-nowrap">
+              <form method="post" action="/delete-attempt/{{ a.id }}" style="margin:0;display:inline"
+                    onsubmit="return confirm('Delete this attempt row?');">
+                <button type="submit" class="btn btn-sm btn-link text-danger p-0" title="Delete">&times;</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+          {% if not attempts %}
+          <tr><td colspan="9" class="text-center text-muted py-5">No event-driven attempts yet.</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+<script>
+setTimeout(function() { location.reload(); }, 10000);
+</script>
+</body>
+</html>"""
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -820,18 +1103,71 @@ _KALSHI_HOST = "demo.kalshi.co" if DEMO_MODE else "kalshi.com"
 
 def _kalshi_url(event_ticker: str, ticker: str, event_slug: str = "") -> str:
     """Build the canonical Kalshi market URL from stored fields."""
+    def _event_root(s: str) -> str:
+        s = (s or "").strip()
+        # Normalize dated series/event tickers like KXBTC15M-26MAR230845 -> KXBTC15M.
+        return re.sub(r"-\d.*$", "", s)
+
     et = event_ticker or ticker
+    et_from_ticker = False
     if et.upper() == ticker.upper():
-        et_lower = re.sub(r"-\d.*$", "", ticker).lower()
+        et_from_ticker = True
+        et_lower = _event_root(ticker).lower()
     else:
-        et_lower = et.lower()
+        et_lower = _event_root(et).lower()
     if "spread" in et_lower:
         et_lower = re.sub(r"spread", "game", et_lower)
         return f"https://{_KALSHI_HOST}/markets/{et_lower}"
-    elif event_slug:
+    slug = (event_slug or "").strip().lower()
+    et_norm = (event_ticker or "").strip().lower()
+    # Slugs that just mirror event ticker aren't useful URL path segments.
+    if slug and slug not in {et_norm, _event_root(event_ticker).lower(), (ticker or "").lower()}:
         return f"https://{_KALSHI_HOST}/markets/{et_lower}/{event_slug}/{ticker.lower()}"
+    if ticker and (not et_from_ticker):
+        # Distinct event + market tickers: placeholder middle segment still resolves.
+        return f"https://{_KALSHI_HOST}/markets/{et_lower}/market/{ticker.lower()}"
+    if ticker and et_from_ticker and re.search(r"-\d", ticker):
+        # Single ticker contains date/series suffix (e.g. ...-26MAR...): treat as market leaf.
+        return f"https://{_KALSHI_HOST}/markets/{et_lower}/market/{ticker.lower()}"
     else:
         return f"https://{_KALSHI_HOST}/markets/{et_lower}"
+
+
+def _url_leaf_ticker(ticker: str, event_ticker: str, outcome_tickers_raw) -> str:
+    """
+    Pick a market ticker for deep-linking.
+    When stored ticker is event-level, use a single outcome ticker if available.
+    """
+    et = event_ticker or ticker or ""
+    tk = ticker or ""
+    outcome_tickers = []
+    try:
+        if isinstance(outcome_tickers_raw, str):
+            outcome_tickers = json.loads(outcome_tickers_raw or "[]")
+        elif isinstance(outcome_tickers_raw, list):
+            outcome_tickers = outcome_tickers_raw
+    except Exception:
+        outcome_tickers = []
+
+    if (not tk or tk.upper() == et.upper()) and len(outcome_tickers) == 1:
+        return outcome_tickers[0]
+    return tk or et
+
+
+def _active_authorized_market_keys() -> set[str]:
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        rows = con.execute("""
+            SELECT market_key
+            FROM authorized_markets
+            WHERE active = 1
+              AND successful_at IS NULL
+        """).fetchall()
+        con.close()
+        return {r["market_key"] for r in rows if r["market_key"]}
+    except Exception:
+        return set()
 
 
 def _get_rows(category=None, limit: int = 200) -> list:
@@ -854,26 +1190,32 @@ def _get_rows(category=None, limit: int = 200) -> list:
     except Exception:
         return []
 
+    active_auth = _active_authorized_market_keys()
     rows = []
     for r in raw:
         try:
             outcomes = json.loads(r["outcomes"])
             prices   = json.loads(r["ask_prices"])
             sizes    = json.loads(r["ask_sizes"])
+            outcome_tickers = json.loads(r["outcome_tickers"] or "[]")
             legs = [
                 {"outcome": o, "price": float(p), "size": float(s)}
                 for o, p, s in zip(outcomes, prices, sizes)
             ]
         except Exception:
+            outcome_tickers = []
             legs = []
         ticker       = r["ticker"]
         event_ticker = r["event_ticker"] or r["ticker"]
         raw_slug     = r["event_slug"] if "event_slug" in r.keys() and r["event_slug"] else ""
-        t_lower      = ticker.lower()
-
-        kalshi_url = _kalshi_url(event_ticker, ticker, raw_slug)
+        link_ticker = _url_leaf_ticker(ticker, event_ticker, outcome_tickers)
+        kalshi_url = _kalshi_url(event_ticker, link_ticker, raw_slug)
+        market_key = r["market_key"] if "market_key" in r.keys() and r["market_key"] else canonical_market_key(
+            ticker, event_ticker, r["outcome_tickers"] if "outcome_tickers" in r.keys() else []
+        )
         rows.append({
             "row_id":        r["id"],
+            "detected_at":   r["detected_at"],
             "time_ago":      _time_ago(r["detected_at"]),
             "question":      r["title"],
             "kalshi_url":    kalshi_url,
@@ -884,13 +1226,69 @@ def _get_rows(category=None, limit: int = 200) -> list:
             "category":      r["category"],
             "has_zero_size": r["has_zero_size"],
             "closes_in":     _closes_in(r["close_time"]),
-            "authorized":         bool(r["authorized"]) if "authorized" in r.keys() else False,
+            "authorized":         market_key in active_auth,
             "trade_id":           r["trade_id"] if "trade_id" in r.keys() else None,
             "trade_status":       r["trade_status"] if "trade_status" in r.keys() else None,
             "trader_invoked_at":  r["trader_invoked_at"] if "trader_invoked_at" in r.keys() else None,
             "volume_24h":         r["volume_24h"] if "volume_24h" in r.keys() else 0,
+            "market_key":         market_key,
         })
     return rows
+
+
+def _get_market_groups(category=None, limit: int = 400) -> list:
+    rows = _get_rows(category=category, limit=limit)
+    groups: dict[str, dict] = {}
+    for r in rows:
+        mk = r.get("market_key") or str(r.get("row_id"))
+        g = groups.get(mk)
+        if g is None:
+            groups[mk] = {
+                "latest": r,
+                "count": 1,
+                "best_net_profit": r["net_profit"],
+                "sources": {r["source"]},
+                "alerts": [r],
+            }
+            continue
+        g["count"] += 1
+        g["best_net_profit"] = max(g["best_net_profit"], r["net_profit"])
+        g["sources"].add(r["source"])
+        g["alerts"].append(r)
+        if r.get("detected_at", "") > g["latest"].get("detected_at", ""):
+            g["latest"] = r
+
+    result = []
+    for mk, g in groups.items():
+        latest = g["latest"]
+        alerts_sorted = sorted(
+            g["alerts"],
+            key=lambda a: a.get("detected_at") or "",
+            reverse=True,
+        )
+        result.append({
+            "market_key": mk,
+            "row_id": latest["row_id"],
+            "detected_at": latest.get("detected_at"),
+            "time_ago": latest["time_ago"],
+            "question": latest["question"],
+            "kalshi_url": latest["kalshi_url"],
+            "closes_in": latest["closes_in"],
+            "authorized": latest["authorized"],
+            "trade_id": latest["trade_id"],
+            "trade_status": latest["trade_status"],
+            "trader_invoked_at": latest["trader_invoked_at"],
+            "volume_24h": latest["volume_24h"],
+            "latest_net_profit": latest["net_profit"],
+            "best_net_profit": g["best_net_profit"],
+            "count": g["count"],
+            "sources": sorted(g["sources"]),
+            "latest_category": latest.get("category", ""),
+            "alerts": alerts_sorted,
+        })
+
+    result.sort(key=lambda x: x.get("detected_at") or "", reverse=True)
+    return result
 
 
 def _get_stats() -> dict:
@@ -905,24 +1303,35 @@ def _get_stats() -> dict:
         ignored          = con.execute("SELECT COUNT(*) FROM opportunities WHERE category='ignored'").fetchone()[0]
         likely_resolved  = con.execute("SELECT COUNT(*) FROM opportunities WHERE category='likely_resolved'").fetchone()[0]
         last          = con.execute("SELECT MAX(detected_at) FROM opportunities").fetchone()[0]
+        tracked_cache = con.execute("SELECT COUNT(*) FROM markets_cache").fetchone()[0]
+        try:
+            ws_row = con.execute("SELECT count, started_at FROM ws_counter WHERE id = 1").fetchone()
+        except sqlite3.OperationalError:
+            ws_row = None
         con.close()
-        # tracked markets count from arb_bot (imported lazily to avoid circular import)
+        # tracked markets count from arb_bot (same-process mode), else fallback to DB cache
         try:
             import arb_bot
-            tracked = len(arb_bot.markets_by_ticker)
+            tracked = len(getattr(arb_bot, "markets_by_ticker", {}) or {})
+            if tracked <= 0:
+                tracked = tracked_cache
         except Exception:
-            tracked = "—"
+            tracked = tracked_cache
         min_vol = int(MIN_VOLUME_24H) if MIN_VOLUME_24H > 0 else "off"
+        ws_count = int(ws_row[0]) if ws_row and ws_row[0] is not None else 0
+        ws_since = _time_ago(ws_row[1]) if ws_row and ws_row[1] else "—"
         return {"total": total, "opps": opps, "near_miss": near_miss,
                 "cumulative": cumulative, "non_exhaustive": non_exhaustive,
                 "spread_market": spread_market, "ignored": ignored,
                 "likely_resolved": likely_resolved, "last_seen_ago": _time_ago(last),
-                "tracked_markets": tracked, "min_volume_24h": min_vol}
+                "tracked_markets": tracked, "min_volume_24h": min_vol,
+                "ws_count": ws_count, "ws_since": ws_since}
     except Exception:
         return {"total": 0, "opps": 0, "near_miss": 0,
                 "cumulative": 0, "non_exhaustive": 0, "spread_market": 0,
                 "ignored": 0, "likely_resolved": 0, "last_seen_ago": "—",
-                "tracked_markets": "—", "min_volume_24h": "—"}
+                "tracked_markets": "—", "min_volume_24h": "—",
+                "ws_count": 0, "ws_since": "—"}
 
 
 # ---------------------------------------------------------------------------
@@ -932,17 +1341,21 @@ def _get_stats() -> dict:
 @app.route("/")
 def index():
     cat   = request.args.get("cat", "")
-    rows  = _get_rows(category=cat or None)
+    view_mode = request.args.get("view", "time")
+    if view_mode not in ("time", "market"):
+        view_mode = "time"
+    rows  = _get_market_groups(category=cat or None) if view_mode == "market" else _get_rows(category=cat or None)
     stats = _get_stats()
     now   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     return render_template_string(TEMPLATE, rows=rows, stats=stats,
-                                  category=cat, now=now,
+                                  category=cat, now=now, view_mode=view_mode,
                                   trading_enabled=TRADING_ENABLED)
 
 
 @app.route("/clear", methods=["POST"])
 def clear_all():
     cat = request.form.get("cat", "")
+    view_mode = request.form.get("view", "time")
     try:
         con = sqlite3.connect(DB_PATH)
         if cat:
@@ -953,12 +1366,13 @@ def clear_all():
         con.close()
     except Exception:
         pass
-    return redirect(url_for("index", cat=cat) if cat else url_for("index"))
+    return redirect(url_for("index", cat=cat, view=view_mode) if cat else url_for("index", view=view_mode))
 
 
 @app.route("/set-category/<int:row_id>", methods=["POST"])
 def set_category(row_id: int):
     cat     = request.form.get("cat", "")
+    view_mode = request.form.get("view", "time")
     new_cat = request.form.get("new_cat", "")
     allowed = {"opportunity", "near_miss", "cumulative", "non_exhaustive",
                "spread_market", "ignored", "likely_resolved"}
@@ -970,20 +1384,32 @@ def set_category(row_id: int):
             con.close()
         except Exception:
             pass
-    return redirect(url_for("index", cat=cat) if cat else url_for("index"))
+    return redirect(url_for("index", cat=cat, view=view_mode) if cat else url_for("index", view=view_mode))
 
 
 @app.route("/delete/<int:row_id>", methods=["POST"])
 def delete_row(row_id: int):
     cat = request.form.get("cat", "")
+    view_mode = request.form.get("view", "time")
     try:
         con = sqlite3.connect(DB_PATH)
-        con.execute("DELETE FROM opportunities WHERE id = ?", (row_id,))
+        if view_mode == "market":
+            mk_row = con.execute(
+                "SELECT market_key FROM opportunities WHERE id = ?",
+                (row_id,),
+            ).fetchone()
+            market_key = mk_row[0] if mk_row else ""
+            if market_key:
+                con.execute("DELETE FROM opportunities WHERE market_key = ?", (market_key,))
+            else:
+                con.execute("DELETE FROM opportunities WHERE id = ?", (row_id,))
+        else:
+            con.execute("DELETE FROM opportunities WHERE id = ?", (row_id,))
         con.commit()
         con.close()
     except Exception:
         pass
-    return redirect(url_for("index", cat=cat) if cat else url_for("index"))
+    return redirect(url_for("index", cat=cat, view=view_mode) if cat else url_for("index", view=view_mode))
 
 
 @app.route("/add-market", methods=["POST"])
@@ -993,7 +1419,8 @@ def add_market():
     from db import save_opportunity
     query = request.form.get("ticker", "").strip().upper()
     cat   = request.form.get("cat", "")
-    back  = url_for("index", cat=cat) if cat else url_for("index")
+    view_mode = request.form.get("view", "time")
+    back  = url_for("index", cat=cat, view=view_mode) if cat else url_for("index", view=view_mode)
     if not query:
         return redirect(back)
     try:
@@ -1052,19 +1479,16 @@ def add_market():
 @app.route("/authorize/<int:row_id>", methods=["POST"])
 def authorize_row(row_id: int):
     cat       = request.form.get("cat", "")
+    view_mode = request.form.get("view", "time")
     authorize = request.form.get("authorize", "1") == "1"
     next_url  = request.form.get("next", "")
     try:
-        con = sqlite3.connect(DB_PATH)
-        con.execute("UPDATE opportunities SET authorized = ? WHERE id = ? AND category = 'opportunity'",
-                    (1 if authorize else 0, row_id))
-        con.commit()
-        con.close()
+        set_authorized(row_id, authorize)
     except Exception:
         pass
     if next_url in ("/authorized", "/trades"):
         return redirect(next_url)
-    return redirect(url_for("index", cat=cat) if cat else url_for("index"))
+    return redirect(url_for("index", cat=cat, view=view_mode) if cat else url_for("index", view=view_mode))
 
 
 @app.route("/api/prices/<int:row_id>")
@@ -1110,6 +1534,15 @@ def api_prices(row_id: int):
             ).fetchall()
             con2.close()
             tickers = [r["ticker"] for r in cache_rows]
+        except Exception:
+            tickers = []
+
+    # Fallback: if cache misses, query live API for event/market and use returned tickers.
+    if not tickers:
+        try:
+            from fetcher import fetch_markets_by_event_or_ticker
+            live_markets = fetch_markets_by_event_or_ticker(event_ticker or row["ticker"])
+            tickers = [m.get("ticker") for m in live_markets if m.get("ticker")]
         except Exception:
             tickers = []
 
@@ -1170,17 +1603,28 @@ def api_prices(row_id: int):
 
 
 def _get_authorized_opps() -> list[dict]:
-    """Return all authorized opportunities with their current trade status."""
+    """Return latest opportunity per active authorized market."""
     try:
         con = sqlite3.connect(DB_PATH)
         con.row_factory = sqlite3.Row
         rows = con.execute("""
-            SELECT o.id as opp_id, o.title, o.net_profit, o.close_time,
-                   o.ticker, o.event_ticker, o.event_slug, o.trade_id,
+            SELECT o.id as opp_id, o.market_key, o.title, o.net_profit, o.close_time,
+                   o.ticker, o.event_ticker, o.event_slug, o.outcome_tickers, o.trade_id,
                    t.status as trade_status
-            FROM opportunities o
+            FROM authorized_markets am
+            JOIN opportunities o
+              ON o.market_key = am.market_key
+            JOIN (
+                SELECT market_key, MAX(detected_at) AS max_detected
+                FROM opportunities
+                WHERE category='opportunity'
+                GROUP BY market_key
+            ) latest
+              ON latest.market_key = o.market_key
+             AND latest.max_detected = o.detected_at
             LEFT JOIN trades t ON o.trade_id = t.id
-            WHERE o.authorized = 1
+            WHERE am.active = 1
+              AND am.successful_at IS NULL
             ORDER BY o.detected_at DESC
         """).fetchall()
         con.close()
@@ -1192,9 +1636,11 @@ def _get_authorized_opps() -> list[dict]:
         event_ticker = r["event_ticker"] or r["ticker"]
         ticker       = r["ticker"]
         event_slug   = r["event_slug"] if "event_slug" in r.keys() else ""
-        kalshi_url   = _kalshi_url(event_ticker, ticker, event_slug or "")
+        link_ticker  = _url_leaf_ticker(ticker, event_ticker, r["outcome_tickers"] if "outcome_tickers" in r.keys() else [])
+        kalshi_url   = _kalshi_url(event_ticker, link_ticker, event_slug or "")
         result.append({
             "opp_id":       r["opp_id"],
+            "market_key":   r["market_key"],
             "title":        r["title"],
             "net_profit":   r["net_profit"],
             "closes_in":    _closes_in(r["close_time"]),
@@ -1212,16 +1658,28 @@ def _get_trades(limit: int = 100) -> tuple[list, dict]:
         con.row_factory = sqlite3.Row
         raw = con.execute("""
             SELECT t.*, o.title as opp_title, o.id as opp_id,
-                   o.ticker as opp_ticker, o.event_ticker, o.event_slug
+                   o.ticker as opp_ticker, o.event_ticker, o.event_slug, o.outcome_tickers
             FROM trades t
             LEFT JOIN opportunities o ON t.opportunity_id = o.id
             ORDER BY t.id DESC
             LIMIT ?
         """, (limit,)).fetchall()
         attempting_raw = con.execute("""
-            SELECT id, title, detected_at, ticker, event_ticker, event_slug
-            FROM opportunities
-            WHERE authorized = 1 AND (trade_id IS NULL OR trade_id = 0)
+            SELECT o.id, o.title, o.detected_at, o.ticker, o.event_ticker, o.event_slug, o.outcome_tickers
+            FROM authorized_markets am
+            JOIN opportunities o ON o.market_key = am.market_key
+            JOIN (
+                SELECT market_key, MAX(detected_at) AS max_detected
+                FROM opportunities
+                WHERE category='opportunity'
+                GROUP BY market_key
+            ) latest
+              ON latest.market_key = o.market_key
+             AND latest.max_detected = o.detected_at
+            LEFT JOIN trades t ON o.trade_id = t.id
+            WHERE am.active = 1
+              AND am.successful_at IS NULL
+              AND (o.trade_id IS NULL OR o.trade_id = 0 OR t.status = 'aborted')
         """).fetchall()
         con.close()
     except Exception:
@@ -1234,6 +1692,7 @@ def _get_trades(limit: int = 100) -> tuple[list, dict]:
 
     # Prepend attempting rows at the top
     for r in attempting_raw:
+        link_ticker = _url_leaf_ticker(r["ticker"], r["event_ticker"] or r["ticker"], r["outcome_tickers"] if "outcome_tickers" in r.keys() else [])
         trades.append({
             "id":            None,
             "status":        "attempting",
@@ -1241,7 +1700,7 @@ def _get_trades(limit: int = 100) -> tuple[list, dict]:
             "demo_mode":     False,
             "opp_id":        r["id"],
             "opp_title":     r["title"],
-            "kalshi_url":    _kalshi_url(r["event_ticker"] or r["ticker"], r["ticker"], r["event_slug"] or ""),
+            "kalshi_url":    _kalshi_url(r["event_ticker"] or r["ticker"], link_ticker, r["event_slug"] or ""),
             "started_ago":   _time_ago(r["detected_at"]),
             "completed_ago": "—",
             "legs":          [],
@@ -1291,6 +1750,7 @@ def _get_trades(limit: int = 100) -> tuple[list, dict]:
         opp_ticker  = r["opp_ticker"] or ""
         opp_evt_tkr = r["event_ticker"] or opp_ticker
         opp_slug    = r["event_slug"] or ""
+        link_ticker = _url_leaf_ticker(opp_ticker, opp_evt_tkr, r["outcome_tickers"] if "outcome_tickers" in r.keys() else [])
         trades.append({
             "id":            r["id"],
             "status":        status,
@@ -1298,7 +1758,7 @@ def _get_trades(limit: int = 100) -> tuple[list, dict]:
             "demo_mode":     bool(r["demo_mode"]),
             "opp_id":        r["opp_id"],
             "opp_title":     r["opp_title"] or f"opp #{r['opportunity_id']}",
-            "kalshi_url":    _kalshi_url(opp_evt_tkr, opp_ticker, opp_slug) if opp_ticker else "",
+            "kalshi_url":    _kalshi_url(opp_evt_tkr, link_ticker, opp_slug) if link_ticker else "",
             "started_ago":   _time_ago(r["started_at"]),
             "completed_ago": _time_ago(r["completed_at"]) if r["completed_at"] else "—",
             "legs":          legs,
@@ -1311,21 +1771,148 @@ def _get_trades(limit: int = 100) -> tuple[list, dict]:
     return trades, stats
 
 
+def _get_attempts(limit: int = 250) -> tuple[list, dict, list]:
+    """Return event-driven attempt rows, summary stats, and top preflight reasons."""
+    default_stats = {"total": 0, "preflight_failed": 0, "order_attempted": 0, "complete": 0}
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        stats_row = con.execute("""
+            SELECT
+              COUNT(*) AS total,
+              SUM(CASE WHEN preflight_ok = 0 THEN 1 ELSE 0 END) AS preflight_failed,
+              SUM(CASE WHEN order_attempted = 1 THEN 1 ELSE 0 END) AS order_attempted,
+              SUM(CASE WHEN final_status = 'complete' THEN 1 ELSE 0 END) AS complete
+            FROM trade_attempts
+            WHERE triggered_by = 'event'
+        """).fetchone()
+        reasons_raw = con.execute("""
+            SELECT preflight_reason AS reason, COUNT(*) AS n
+            FROM trade_attempts
+            WHERE triggered_by = 'event'
+              AND preflight_ok = 0
+              AND preflight_reason IS NOT NULL
+              AND preflight_reason != ''
+            GROUP BY preflight_reason
+            ORDER BY n DESC, preflight_reason ASC
+            LIMIT 10
+        """).fetchall()
+        attempts_raw = con.execute("""
+            SELECT
+              ta.*,
+              (
+                SELECT o.title
+                FROM opportunities o
+                WHERE o.market_key = ta.market_key
+                ORDER BY o.detected_at DESC
+                LIMIT 1
+              ) AS market_title,
+              (
+                SELECT o.ticker
+                FROM opportunities o
+                WHERE o.market_key = ta.market_key
+                ORDER BY o.detected_at DESC
+                LIMIT 1
+              ) AS ticker,
+              (
+                SELECT o.event_ticker
+                FROM opportunities o
+                WHERE o.market_key = ta.market_key
+                ORDER BY o.detected_at DESC
+                LIMIT 1
+              ) AS event_ticker,
+              (
+                SELECT o.event_slug
+                FROM opportunities o
+                WHERE o.market_key = ta.market_key
+                ORDER BY o.detected_at DESC
+                LIMIT 1
+              ) AS event_slug
+              ,
+              (
+                SELECT o.outcome_tickers
+                FROM opportunities o
+                WHERE o.market_key = ta.market_key
+                ORDER BY o.detected_at DESC
+                LIMIT 1
+              ) AS outcome_tickers
+            FROM trade_attempts ta
+            WHERE ta.triggered_by = 'event'
+            ORDER BY ta.triggered_at DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        con.close()
+    except Exception:
+        return [], default_stats, []
+
+    stats = default_stats.copy()
+    if stats_row:
+        stats = {
+            "total": int(stats_row["total"] or 0),
+            "preflight_failed": int(stats_row["preflight_failed"] or 0),
+            "order_attempted": int(stats_row["order_attempted"] or 0),
+            "complete": int(stats_row["complete"] or 0),
+        }
+
+    reasons = [{"reason": r["reason"], "n": int(r["n"] or 0)} for r in reasons_raw]
+    attempts = []
+    for r in attempts_raw:
+        ticker = r["ticker"] or ""
+        event_ticker = r["event_ticker"] or ticker
+        event_slug = r["event_slug"] or ""
+        link_ticker = _url_leaf_ticker(ticker, event_ticker, r["outcome_tickers"] if "outcome_tickers" in r.keys() else [])
+        kalshi_url = _kalshi_url(event_ticker, link_ticker, event_slug) if link_ticker else ""
+        attempts.append({
+            "id": r["id"],
+            "when": _time_ago(r["triggered_at"]),
+            "market_key": r["market_key"] or "—",
+            "market_title": r["market_title"] or "",
+            "preflight_ok": r["preflight_ok"],
+            "order_attempted": bool(r["order_attempted"]),
+            "preflight_reason": r["preflight_reason"],
+            "final_status": r["final_status"],
+            "trade_id": r["trade_id"],
+            "kalshi_url": kalshi_url,
+        })
+    return attempts, stats, reasons
+
+
 @app.route("/delete-trade/<int:trade_id>", methods=["POST"])
 def delete_trade(trade_id: int):
     try:
         con = sqlite3.connect(DB_PATH)
-        # Deauthorize the linked opportunity and clear its trade_id
-        con.execute(
-            "UPDATE opportunities SET trade_id = NULL, authorized = 0 WHERE trade_id = ?",
-            (trade_id,),
-        )
+        # Clear linked row pointer only; market-level auth is managed separately.
+        con.execute("UPDATE opportunities SET trade_id = NULL WHERE trade_id = ?", (trade_id,))
         con.execute("DELETE FROM trades WHERE id = ?", (trade_id,))
         con.commit()
         con.close()
     except Exception:
         pass
     return redirect(url_for("trades_page"))
+
+
+@app.route("/clear-attempts", methods=["POST"])
+def clear_attempts():
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute("DELETE FROM trade_attempts WHERE triggered_by = 'event'")
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+    return redirect(url_for("attempts_page"))
+
+
+@app.route("/delete-attempt/<int:attempt_id>", methods=["POST"])
+def delete_attempt(attempt_id: int):
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute("DELETE FROM trade_attempts WHERE id = ? AND triggered_by = 'event'", (attempt_id,))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+    return redirect(url_for("attempts_page"))
 
 
 @app.route("/authorized")
@@ -1343,6 +1930,21 @@ def trades_page():
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     return render_template_string(TRADES_TEMPLATE, trades=trades, stats=stats, now=now,
                                   page_title="Trades", active_tab="trades")
+
+
+@app.route("/attempts")
+def attempts_page():
+    attempts, stats, reasons = _get_attempts()
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return render_template_string(
+        ATTEMPTS_TEMPLATE,
+        attempts=attempts,
+        stats=stats,
+        reasons=reasons,
+        now=now,
+        page_title="Event-Driven Attempts",
+        active_tab="attempts",
+    )
 
 
 if __name__ == "__main__":

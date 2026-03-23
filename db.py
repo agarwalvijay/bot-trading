@@ -67,6 +67,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
 from config import DB_PATH
+from market_key import canonical_market_key
 
 
 @contextmanager
@@ -153,8 +154,51 @@ def init_db() -> None:
                 notes            TEXT
             )
         """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS authorized_markets (
+                market_key          TEXT PRIMARY KEY,
+                active              INTEGER NOT NULL DEFAULT 1,
+                authorized_at       TEXT NOT NULL,
+                authorized_by_row_id INTEGER,
+                successful_trade_id INTEGER,
+                successful_order_id TEXT,
+                successful_at       TEXT,
+                disabled_at         TEXT,
+                disabled_reason     TEXT
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS ws_counter (
+                id         INTEGER PRIMARY KEY CHECK (id = 1),
+                count      INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT,
+                updated_at TEXT
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS trade_attempts (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                opportunity_id   INTEGER,
+                market_key       TEXT NOT NULL DEFAULT '',
+                triggered_by     TEXT NOT NULL DEFAULT 'event',   -- event | poll
+                triggered_at     TEXT NOT NULL,
+                preflight_ok     INTEGER,
+                preflight_reason TEXT,
+                order_attempted  INTEGER NOT NULL DEFAULT 0,
+                first_order_id   TEXT,
+                trade_id         INTEGER,
+                final_status     TEXT
+            )
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_attempts_triggered_at ON trade_attempts (triggered_at DESC)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_attempts_market_key ON trade_attempts (market_key)")
+        con.execute("""
+            INSERT OR IGNORE INTO ws_counter (id, count, started_at, updated_at)
+            VALUES (1, 0, NULL, NULL)
+        """)
         _add_column_if_missing(con, "trades",        "exit_prices",      "TEXT NOT NULL DEFAULT '[]'")
         _add_column_if_missing(con, "trades",        "exit_pnl",         "REAL")
+        _add_column_if_missing(con, "trades",        "market_key",       "TEXT NOT NULL DEFAULT ''")
         _add_column_if_missing(con, "opportunities", "event_ticker",     "TEXT NOT NULL DEFAULT ''")
         _add_column_if_missing(con, "opportunities", "close_time",       "TEXT")
         _add_column_if_missing(con, "opportunities", "taker_fee_coeff",  "REAL NOT NULL DEFAULT 0.07")
@@ -164,7 +208,23 @@ def init_db() -> None:
         _add_column_if_missing(con, "opportunities", "volume_24h",       "REAL NOT NULL DEFAULT 0")
         _add_column_if_missing(con, "opportunities", "event_slug",         "TEXT NOT NULL DEFAULT ''")
         _add_column_if_missing(con, "opportunities", "trader_invoked_at", "TEXT")
+        _add_column_if_missing(con, "opportunities", "market_key",        "TEXT NOT NULL DEFAULT ''")
         _add_column_if_missing(con, "markets_cache", "subtitle",          "TEXT NOT NULL DEFAULT ''")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_opp_market_key ON opportunities (market_key)")
+
+        # Backfill market_key for older rows.
+        rows = con.execute("""
+            SELECT id, ticker, event_ticker, outcome_tickers
+            FROM opportunities
+            WHERE market_key IS NULL OR market_key = ''
+        """).fetchall()
+        for r in rows:
+            mkey = canonical_market_key(
+                r["ticker"],
+                r["event_ticker"],
+                r["outcome_tickers"],
+            )
+            con.execute("UPDATE opportunities SET market_key = ? WHERE id = ?", (mkey, r["id"]))
 
 
 def _add_column_if_missing(con: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -175,14 +235,25 @@ def _add_column_if_missing(con: sqlite3.Connection, table: str, column: str, def
 
 def save_opportunity(opp: dict[str, Any]) -> int:
     """Insert one opportunity or near-miss row; returns the new row id."""
+    outcome_tickers = opp.get("outcome_tickers", [])
+    market_key = canonical_market_key(
+        opp.get("ticker", ""),
+        opp.get("event_ticker", ""),
+        outcome_tickers,
+    )
     with _conn() as con:
+        auth_row = con.execute("""
+            SELECT 1 FROM authorized_markets
+            WHERE market_key = ? AND active = 1 AND successful_at IS NULL
+            LIMIT 1
+        """, (market_key,)).fetchone()
         cur = con.execute("""
             INSERT INTO opportunities
                 (detected_at, ticker, event_ticker, title, outcomes,
                  ask_prices, ask_sizes, sum_asks, gross_profit, total_fees,
                  net_profit, taker_fee_coeff, source, category, has_zero_size,
-                 close_time, outcome_tickers, volume_24h, event_slug)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 close_time, outcome_tickers, volume_24h, event_slug, market_key, authorized)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             datetime.now(timezone.utc).isoformat(),
             opp["ticker"],
@@ -200,9 +271,11 @@ def save_opportunity(opp: dict[str, Any]) -> int:
             opp.get("category", "opportunity"),
             1 if opp.get("has_zero_size") else 0,
             opp.get("close_time"),
-            json.dumps(opp.get("outcome_tickers", [])),
+            json.dumps(outcome_tickers),
             opp.get("volume_24h", 0.0),
             opp.get("event_slug", ""),
+            market_key,
+            1 if auth_row else 0,
         ))
         return cur.lastrowid
 
@@ -320,23 +393,185 @@ def markets_cache_count() -> int:
 # ---------------------------------------------------------------------------
 
 def get_authorized_opportunities() -> list[dict]:
-    """Return opportunity rows authorized for trading that have no active (non-aborted) trade."""
+    """Return latest opportunity per authorized market eligible for trading."""
+    now_iso = datetime.now(timezone.utc).isoformat()
     with _conn() as con:
         rows = con.execute("""
             SELECT o.* FROM opportunities o
+            JOIN (
+                SELECT market_key, MAX(detected_at) AS max_detected
+                FROM opportunities
+                WHERE category = 'opportunity'
+                GROUP BY market_key
+            ) latest
+              ON latest.market_key = o.market_key
+             AND latest.max_detected = o.detected_at
+            JOIN authorized_markets am
+              ON am.market_key = o.market_key
+             AND am.active = 1
+             AND am.successful_at IS NULL
             LEFT JOIN trades t ON o.trade_id = t.id
-            WHERE o.authorized = 1
-              AND o.category   = 'opportunity'
+            WHERE o.category   = 'opportunity'
+              AND o.market_key <> ''
+              AND (o.close_time IS NULL OR o.close_time > ?)
               AND (o.trade_id IS NULL OR o.trade_id = 0 OR t.status = 'aborted')
             ORDER BY o.net_profit DESC
-        """).fetchall()
+        """, (now_iso,)).fetchall()
     return [dict(r) for r in rows]
 
 
 def set_authorized(row_id: int, authorized: bool) -> None:
     with _conn() as con:
-        con.execute("UPDATE opportunities SET authorized = ? WHERE id = ?",
-                    (1 if authorized else 0, row_id))
+        row = con.execute("""
+            SELECT id, ticker, event_ticker, outcome_tickers
+            FROM opportunities
+            WHERE id = ?
+        """, (row_id,)).fetchone()
+        if not row:
+            return
+        market_key = canonical_market_key(
+            row["ticker"],
+            row["event_ticker"],
+            row["outcome_tickers"],
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        if authorized:
+            con.execute("""
+                INSERT INTO authorized_markets
+                    (market_key, active, authorized_at, authorized_by_row_id,
+                     successful_trade_id, successful_order_id, successful_at, disabled_at, disabled_reason)
+                VALUES (?, 1, ?, ?, NULL, NULL, NULL, NULL, NULL)
+                ON CONFLICT(market_key) DO UPDATE SET
+                    active = 1,
+                    authorized_at = excluded.authorized_at,
+                    authorized_by_row_id = excluded.authorized_by_row_id,
+                    successful_trade_id = NULL,
+                    successful_order_id = NULL,
+                    successful_at = NULL,
+                    disabled_at = NULL,
+                    disabled_reason = NULL
+            """, (market_key, now, row_id))
+            con.execute("UPDATE opportunities SET authorized = 1 WHERE market_key = ?", (market_key,))
+        else:
+            con.execute("""
+                UPDATE authorized_markets
+                SET active = 0, disabled_at = ?, disabled_reason = 'manual'
+                WHERE market_key = ?
+            """, (now, market_key))
+            con.execute("UPDATE opportunities SET authorized = 0 WHERE market_key = ?", (market_key,))
+
+
+def is_market_authorized(market_key: str) -> bool:
+    with _conn() as con:
+        row = con.execute("""
+            SELECT 1 FROM authorized_markets
+            WHERE market_key = ?
+              AND active = 1
+              AND successful_at IS NULL
+            LIMIT 1
+        """, (market_key,)).fetchone()
+    return row is not None
+
+
+def get_authorized_market_keys() -> list[str]:
+    with _conn() as con:
+        rows = con.execute("""
+            SELECT market_key
+            FROM authorized_markets
+            WHERE active = 1
+              AND successful_at IS NULL
+            ORDER BY authorized_at DESC
+        """).fetchall()
+    return [r["market_key"] for r in rows]
+
+
+def mark_market_success(market_key: str, trade_id: int, order_id: str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as con:
+        con.execute("""
+            UPDATE authorized_markets
+            SET active = 0,
+                successful_trade_id = ?,
+                successful_order_id = ?,
+                successful_at = ?,
+                disabled_at = ?,
+                disabled_reason = 'success'
+            WHERE market_key = ?
+        """, (trade_id, order_id, now, now, market_key))
+        con.execute("UPDATE opportunities SET authorized = 0 WHERE market_key = ?", (market_key,))
+
+
+def disable_market_authorization(market_key: str, reason: str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as con:
+        con.execute("""
+            UPDATE authorized_markets
+            SET active = 0,
+                disabled_at = ?,
+                disabled_reason = ?
+            WHERE market_key = ?
+              AND active = 1
+              AND successful_at IS NULL
+        """, (now, reason, market_key))
+        con.execute("UPDATE opportunities SET authorized = 0 WHERE market_key = ?", (market_key,))
+
+
+def increment_ws_counter(delta: int = 1, max_count: int = 10000) -> None:
+    """
+    Increment persistent WS notification counter.
+    Resets to 0 and restarts timer when count reaches max_count.
+    """
+    if delta <= 0:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as con:
+        row = con.execute(
+            "SELECT count, started_at FROM ws_counter WHERE id = 1"
+        ).fetchone()
+        if not row:
+            con.execute(
+                "INSERT INTO ws_counter (id, count, started_at, updated_at) VALUES (1, 0, ?, ?)",
+                (now, now),
+            )
+            curr = 0
+            started_at = now
+        else:
+            curr = int(row["count"] or 0)
+            started_at = row["started_at"] or now
+
+        new_count = curr + delta
+        if new_count >= max_count:
+            con.execute(
+                "UPDATE ws_counter SET count = 0, started_at = ?, updated_at = ? WHERE id = 1",
+                (now, now),
+            )
+        else:
+            con.execute(
+                "UPDATE ws_counter SET count = ?, started_at = ?, updated_at = ? WHERE id = 1",
+                (new_count, started_at, now),
+            )
+
+
+def create_trade_attempt(opportunity_id: int, market_key: str, triggered_by: str) -> int:
+    """Insert an attempt audit row and return attempt_id."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as con:
+        cur = con.execute("""
+            INSERT INTO trade_attempts
+                (opportunity_id, market_key, triggered_by, triggered_at)
+            VALUES (?, ?, ?, ?)
+        """, (opportunity_id, market_key or "", triggered_by, now))
+        return cur.lastrowid
+
+
+def update_trade_attempt(attempt_id: int, **fields) -> None:
+    """Update arbitrary fields on a trade_attempts row."""
+    if not attempt_id or not fields:
+        return
+    sets = ", ".join(f"{k} = ?" for k in fields)
+    vals = list(fields.values()) + [attempt_id]
+    with _conn() as con:
+        con.execute(f"UPDATE trade_attempts SET {sets} WHERE id = ?", vals)
 
 
 def stamp_trader_invoked(opp_id: int) -> None:
@@ -361,10 +596,16 @@ def has_fresh_detection(ticker: str, since_iso: str) -> bool:
 def mark_likely_resolved(opp_id: int) -> None:
     """Deauthorize and recategorize an opportunity the trader detected as likely resolved."""
     with _conn() as con:
-        con.execute(
-            "UPDATE opportunities SET authorized = 0, category = 'likely_resolved' WHERE id = ?",
-            (opp_id,),
-        )
+        row = con.execute("SELECT market_key FROM opportunities WHERE id = ?", (opp_id,)).fetchone()
+        con.execute("UPDATE opportunities SET authorized = 0, category = 'likely_resolved' WHERE id = ?", (opp_id,))
+        if row and row["market_key"]:
+            con.execute("""
+                UPDATE authorized_markets
+                SET active = 0, disabled_at = ?, disabled_reason = 'likely_resolved'
+                WHERE market_key = ?
+                  AND active = 1
+                  AND successful_at IS NULL
+            """, (datetime.now(timezone.utc).isoformat(), row["market_key"]))
 
 
 def create_trade(opportunity_id: int, leg_tickers: list, leg_counts: list,
@@ -373,11 +614,13 @@ def create_trade(opportunity_id: int, leg_tickers: list, leg_counts: list,
     """Insert a new trade row and link it to the opportunity. Returns trade id."""
     now = datetime.now(timezone.utc).isoformat()
     with _conn() as con:
+        opp = con.execute("SELECT market_key FROM opportunities WHERE id = ?", (opportunity_id,)).fetchone()
+        market_key = opp["market_key"] if opp and opp["market_key"] else ""
         cur = con.execute("""
             INSERT INTO trades
                 (opportunity_id, status, demo_mode, started_at,
-                 leg_tickers, leg_counts, target_prices, client_order_ids)
-            VALUES (?, 'pending', ?, ?, ?, ?, ?, ?)
+                 leg_tickers, leg_counts, target_prices, client_order_ids, market_key)
+            VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?)
         """, (
             opportunity_id,
             1 if demo_mode else 0,
@@ -386,6 +629,7 @@ def create_trade(opportunity_id: int, leg_tickers: list, leg_counts: list,
             json.dumps(leg_counts),
             json.dumps(target_prices),
             json.dumps(client_order_ids),
+            market_key,
         ))
         trade_id = cur.lastrowid
         con.execute("UPDATE opportunities SET trade_id = ? WHERE id = ?",

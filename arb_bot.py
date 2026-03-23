@@ -58,13 +58,15 @@ from config import (
 from db import (
     init_db, opportunity_count, save_opportunity, update_opportunity,
     load_markets_from_cache, save_markets_cache, markets_cache_count,
+    get_authorized_market_keys, increment_ws_counter, is_market_authorized,
 )
 from trader import settle_loop, trading_loop
+from market_key import canonical_market_key
 
 # Set by WS/REST handlers when a fresh arb opportunity is detected.
 # Wakes the trading loop immediately rather than waiting TRADE_POLL_INTERVAL.
 _trade_trigger = threading.Event()
-# opp_ids pushed here get sorted to the front of the next trading tick.
+# market_keys pushed here get sorted to the front of the next trading tick.
 _trade_priority_ids: collections.deque = collections.deque(maxlen=20)
 from fetcher import (
     KalshiWSClient,
@@ -782,9 +784,14 @@ def _rest_handle_result(result: dict) -> None:
     # WS priority: promote opportunity tickers for real-time tracking
     if result["category"] == "opportunity":
         _prioritize_opportunity_tickers([result["ticker"]])
-        if row_id:
-            _trade_priority_ids.append(row_id)
-        _trade_trigger.set()  # wake trading loop immediately
+        market_key = result.get("market_key") or canonical_market_key(
+            result.get("ticker"),
+            result.get("event_ticker", ""),
+            result.get("outcome_tickers", []),
+        )
+        if market_key and is_market_authorized(market_key):
+            _trade_priority_ids.append(market_key)
+            _trade_trigger.set()  # wake trading loop immediately
 
     with alert_cooldown_lock:
         rec = alert_cooldown.get(key)
@@ -962,20 +969,20 @@ def ws_event_loop(event_queue: queue.Queue, stop_event: threading.Event) -> None
 
         if msg_type == "ws_connected":
             # WS (re)connected — ensure authorized opps are watched and trigger trader
-            from db import get_authorized_opportunities
-            auth_opps = get_authorized_opportunities()
-            if auth_opps:
-                tickers = [o["ticker"] for o in auth_opps if o.get("ticker")]
+            auth_market_keys = get_authorized_market_keys()
+            if auth_market_keys:
+                tickers = [mk for mk in auth_market_keys if mk]
                 if tickers:
                     _prioritize_opportunity_tickers(tickers)
                 if TRADING_ENABLED:
-                    for o in auth_opps:
-                        _trade_priority_ids.append(o["id"])
+                    for mk in auth_market_keys:
+                        _trade_priority_ids.append(mk)
                     _trade_trigger.set()
-                    logger.info("WS (re)connected: triggering trader for %d authorized opp(s)", len(auth_opps))
+                    logger.info("WS (re)connected: triggering trader for %d authorized market(s)", len(auth_market_keys))
             continue
 
         if msg_type == "ticker":
+            increment_ws_counter()
             msg = event.get("msg", {})
             ticker = msg.get("market_ticker", "")
             if not ticker:
@@ -1075,9 +1082,14 @@ def _check_ticker_market(ticker: str, source: str) -> None:
             return
 
         row_id = save_opportunity(result)
-        if row_id:
-            _trade_priority_ids.append(row_id)
-        _trade_trigger.set()  # wake trading loop immediately
+        market_key = result.get("market_key") or canonical_market_key(
+            result.get("ticker"),
+            result.get("event_ticker", ""),
+            result.get("outcome_tickers", []),
+        )
+        if market_key and is_market_authorized(market_key):
+            _trade_priority_ids.append(market_key)
+            _trade_trigger.set()  # wake trading loop immediately
         mins = _minutes_to_close(result.get("close_time"))
         if mins is not None and mins < EXPIRING_SOON_MINS:
             if (5 <= mins < EXPIRING_SOON_MINS
@@ -1388,13 +1400,12 @@ def main() -> None:
 
             # Fire trader for any opportunities already authorized in the DB
             if TRADING_ENABLED:
-                from db import get_authorized_opportunities
-                auth_opps = get_authorized_opportunities()
-                if auth_opps:
-                    for o in auth_opps:
-                        _trade_priority_ids.append(o["id"])
+                auth_market_keys = get_authorized_market_keys()
+                if auth_market_keys:
+                    for mk in auth_market_keys:
+                        _trade_priority_ids.append(mk)
                     _trade_trigger.set()
-                    logger.info("Initial load: %d authorized opp(s) found in DB — trader triggered", len(auth_opps))
+                    logger.info("Initial load: %d authorized market(s) found in DB — trader triggered", len(auth_market_keys))
 
         except Exception as exc:
             logger.error("Initial API market scan failed: %s", exc)
